@@ -19,6 +19,11 @@ candle-backend = ["candle-core", "candle-nn"]
 cuda = ["onnx"]
 tensorrt = ["onnx"]
 all-backends = ["onnx", "tch-backend", "candle-backend"]
+# StalyaTech RuView Phase 2: CviTek TPU runtime backend for CV1812CP / SG2000.
+# Enables unsafe FFI to libcviruntime.so and the CviTekBackend impl.
+# Requires CVITEK_SDK_DIR env at build time pointing to a sysroot that
+# ships libcviruntime.so + cviruntime.h (see crates/.../build.rs).
+cvitek = []
 
 [dependencies]
 # Core utilities

@@ -38,12 +38,21 @@ pub mod onnx;
 pub mod tensor;
 pub mod translator;
 
+// StalyaTech RuView Phase 2: CviTek TPU backend module.  The crate-level
+// `#![deny(unsafe_code)]` lint blocks raw FFI everywhere else, but the
+// cvitek module is explicitly allowed because it wraps libcviruntime.so.
+#[cfg(feature = "cvitek")]
+#[allow(unsafe_code)]
+pub mod cvitek;
+
 // Re-exports for convenience
 pub use densepose::{DensePoseConfig, DensePoseHead, DensePoseOutput};
 pub use error::{NnError, NnResult};
 pub use inference::{Backend, InferenceEngine, InferenceOptions};
 #[cfg(feature = "onnx")]
 pub use onnx::{OnnxBackend, OnnxSession};
+#[cfg(feature = "cvitek")]
+pub use cvitek::CviTekBackend;
 pub use tensor::{Tensor, TensorShape};
 pub use translator::{ModalityTranslator, TranslatorConfig, TranslatorOutput};
 
@@ -54,6 +63,8 @@ pub mod prelude {
     pub use crate::inference::{Backend, InferenceEngine, InferenceOptions};
     #[cfg(feature = "onnx")]
     pub use crate::onnx::{OnnxBackend, OnnxSession};
+    #[cfg(feature = "cvitek")]
+    pub use crate::cvitek::CviTekBackend;
     pub use crate::tensor::{Tensor, TensorShape};
     pub use crate::translator::{ModalityTranslator, TranslatorConfig, TranslatorOutput};
 }
