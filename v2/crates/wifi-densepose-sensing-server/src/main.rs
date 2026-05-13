@@ -66,6 +66,18 @@ use wifi_densepose_signal::ruvsense::pose_tracker::PoseTracker;
 use wifi_densepose_signal::ruvsense::multistatic::{MultistaticFuser, MultistaticConfig};
 use wifi_densepose_signal::ruvsense::field_model::{FieldModel, CalibrationStatus};
 
+// StalyaTech RuView Phase 2.1 / 2.2a: optional NN backend (currently
+// CviTek TPU for the SG2000).  Gated behind the `cvitek` Cargo feature.
+// Phase 2.2a introduces the live `Arc<dyn Backend>` handle stored inside
+// AppState for runtime dispatch via POST /api/v1/backend/run.
+#[cfg(feature = "cvitek")]
+use wifi_densepose_nn::{Backend as NnBackend, CviTekBackend, Tensor as NnTensor};
+
+/// Type alias for the runtime-dispatched NN backend handle stored in
+/// AppState.  Only present when compiled with `--features cvitek`.
+#[cfg(feature = "cvitek")]
+type BackendHandle = std::sync::Arc<dyn NnBackend + Send + Sync>;
+
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
@@ -114,6 +126,16 @@ struct Args {
     /// Load a trained .rvf model for inference
     #[arg(long, value_name = "PATH")]
     model: Option<PathBuf>,
+
+    /// StalyaTech RuView Phase 2.1: NN backend dispatch for `--model`.
+    ///
+    /// * `none` — do not initialise any backend (default; legacy behaviour)
+    /// * `cvitek` — load `--model` as a `.cvimodel` on the SG2000 TPU via
+    ///   libcviruntime.so (requires this crate built with `--features cvitek`)
+    /// * `auto` — pick the first available backend (currently equivalent to
+    ///   `cvitek` when compiled in, else `none`)
+    #[arg(long, value_name = "BACKEND", default_value = "none")]
+    backend: String,
 
     /// Enable progressive loading (Layer A instant start)
     #[arg(long)]
@@ -642,6 +664,17 @@ struct AppStateInner {
     multistatic_fuser: MultistaticFuser,
     /// SVD-based room field model for eigenvalue person counting (None until calibration).
     field_model: Option<FieldModel>,
+    /// StalyaTech RuView Phase 2.1: diagnostic snapshot of the loaded NN
+    /// inference backend (currently CviTek TPU on SG2000) — name, target,
+    /// version, input/output descriptors.  `None` when no backend was
+    /// requested via `--backend`.  Surfaced via GET /api/v1/backend/info.
+    inference_backend_info: Option<serde_json::Value>,
+    /// StalyaTech RuView Phase 2.2a: live `Arc<dyn Backend>` handle so
+    /// `POST /api/v1/backend/run` (and, in Phase 2.2c, the tick task) can
+    /// dispatch inference without re-loading the model.  Only present
+    /// when this binary was built with `--features cvitek`.
+    #[cfg(feature = "cvitek")]
+    inference_backend: Option<BackendHandle>,
 }
 
 /// If no ESP32 frame arrives within this duration, source reverts to offline.
@@ -3520,6 +3553,146 @@ async fn model_info(State(state): State<SharedState>) -> Json<serde_json::Value>
     }
 }
 
+/// StalyaTech RuView Phase 2.1: surface the NN inference backend snapshot
+/// captured during startup so operators can confirm `--backend cvitek` lit
+/// up the TPU runtime and the `.cvimodel` IO descriptors parsed cleanly.
+async fn backend_info(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let s = state.read().await;
+    match &s.inference_backend_info {
+        Some(info) => Json(info.clone()),
+        None => Json(serde_json::json!({
+            "status": "disabled",
+            "message": "No NN backend requested. Pass --backend cvitek --model <PATH>.cvimodel to enable the SG2000 TPU runtime.",
+        })),
+    }
+}
+
+/// StalyaTech RuView Phase 2.2a: dispatch a single inference pass through
+/// the live backend handle with a zero-filled input tensor (built from
+/// the runtime-reported input shape) and return latency + per-output
+/// summary statistics.  Confirms the end-to-end runtime is healthy
+/// without requiring a CSI-aware model; a true tick-task hookup with
+/// real CSI input arrives in Phase 2.2c.
+#[cfg(feature = "cvitek")]
+async fn backend_run(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    use std::collections::HashMap;
+
+    // Clone the Arc handle out from under the lock so the Forward call
+    // is not serialised against unrelated AppState readers.
+    let backend = {
+        let s = state.read().await;
+        s.inference_backend.clone()
+    };
+    let backend = match backend {
+        Some(b) => b,
+        None => {
+            return Json(serde_json::json!({
+                "status": "disabled",
+                "message": "No live NN backend; start with --backend cvitek --model <PATH>.cvimodel",
+            }));
+        }
+    };
+
+    // Build a zero-filled input for every named input the backend reports.
+    let mut inputs: HashMap<String, NnTensor> = HashMap::new();
+    for name in backend.input_names() {
+        let shape = match backend.input_shape(&name) {
+            Some(s) => s,
+            None => {
+                return Json(serde_json::json!({
+                    "status": "error",
+                    "reason": format!("backend lost shape metadata for input '{name}'"),
+                }));
+            }
+        };
+        let dims = shape.dims();
+        if dims.len() != 4 {
+            return Json(serde_json::json!({
+                "status": "unsupported",
+                "reason": format!("input '{name}' has {}D shape {:?}; Phase 2.2a only supports 4D zero inputs", dims.len(), dims),
+            }));
+        }
+        let tensor = NnTensor::zeros_4d([dims[0], dims[1], dims[2], dims[3]]);
+        inputs.insert(name, tensor);
+    }
+
+    // Run the forward pass on a blocking thread so the Tokio reactor
+    // is not held up by a TPU DMA wait.
+    let started = std::time::Instant::now();
+    let bk = backend.clone();
+    let outputs = match tokio::task::spawn_blocking(move || bk.run(inputs)).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            return Json(serde_json::json!({
+                "status": "error",
+                "reason": e.to_string(),
+            }));
+        }
+        Err(e) => {
+            return Json(serde_json::json!({
+                "status": "error",
+                "reason": format!("join error: {e}"),
+            }));
+        }
+    };
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+    // Summarise every output tensor as min/max/mean/nonzero count so the
+    // caller can sanity-check the result without parsing the full tensor.
+    let mut output_summary = Vec::with_capacity(outputs.len());
+    for (name, tensor) in outputs.iter() {
+        let dims = tensor.shape().dims().to_vec();
+        let data = match tensor.to_vec() {
+            Ok(d) => d,
+            Err(e) => {
+                output_summary.push(serde_json::json!({
+                    "name": name,
+                    "shape": dims,
+                    "error": e.to_string(),
+                }));
+                continue;
+            }
+        };
+        let n = data.len();
+        let (mut mn, mut mx, mut sum, mut nonzero) =
+            (f32::INFINITY, f32::NEG_INFINITY, 0.0_f64, 0usize);
+        for &v in &data {
+            if v < mn { mn = v; }
+            if v > mx { mx = v; }
+            sum += v as f64;
+            if v != 0.0 { nonzero += 1; }
+        }
+        let mean = if n > 0 { sum / n as f64 } else { 0.0 };
+        output_summary.push(serde_json::json!({
+            "name": name,
+            "shape": dims,
+            "count": n,
+            "min": mn,
+            "max": mx,
+            "mean": mean,
+            "nonzero": nonzero,
+        }));
+    }
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "latency_ms": elapsed_ms,
+        "outputs": output_summary,
+        "note": "Phase 2.2a smoke run — zero-filled inputs; mean/nonzero stats useful as sanity check only.",
+    }))
+}
+
+/// Stub variant for builds without the `cvitek` feature so the route can
+/// still be registered (clients receive a structured "disabled" reply
+/// rather than a 404).
+#[cfg(not(feature = "cvitek"))]
+async fn backend_run(State(_state): State<SharedState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "status": "disabled",
+        "message": "Rebuild with --features cvitek to enable runtime inference dispatch.",
+    }))
+}
+
 async fn model_layers(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let s = state.read().await;
     match &s.progressive_loader {
@@ -4221,6 +4394,158 @@ async fn broadcast_tick_task(state: SharedState, tick_ms: u64) {
     }
 }
 
+// ── StalyaTech RuView Phase 2.1: NN backend init ─────────────────────────────
+
+/// Output of `init_inference_backend`: a diagnostic JSON (always populated
+/// when a backend was requested, even on failure) plus the live handle
+/// when the load succeeded.
+///
+/// Phase 2.1 returned only the diagnostic JSON; Phase 2.2a retains the
+/// live `Arc<dyn Backend>` so request handlers can dispatch inference
+/// without re-loading the model.
+pub struct InferenceBackendInit {
+    pub info: Option<serde_json::Value>,
+    #[cfg(feature = "cvitek")]
+    pub handle: Option<BackendHandle>,
+}
+
+/// Initialise the NN inference backend selected by `--backend`.  Always
+/// returns a diagnostic JSON (for `/api/v1/backend/info`); when compiled
+/// with `--features cvitek` it also returns a live `Arc<dyn Backend>`
+/// handle for `/api/v1/backend/run` and (in Phase 2.2c) the tick task.
+fn init_inference_backend(
+    backend_name: &str,
+    model_path: Option<&std::path::Path>,
+) -> InferenceBackendInit {
+    let name = backend_name.trim().to_ascii_lowercase();
+    match name.as_str() {
+        "" | "none" => InferenceBackendInit {
+            info: None,
+            #[cfg(feature = "cvitek")]
+            handle: None,
+        },
+        "auto" | "cvitek" => {
+            #[cfg(feature = "cvitek")]
+            {
+                let (info, handle) = init_cvitek_backend(model_path, &name);
+                InferenceBackendInit { info: Some(info), handle }
+            }
+            #[cfg(not(feature = "cvitek"))]
+            {
+                InferenceBackendInit {
+                    info: Some(serde_json::json!({
+                        "status": "unavailable",
+                        "requested": name,
+                        "reason": "this binary was compiled without `--features cvitek`",
+                    })),
+                }
+            }
+        }
+        other => InferenceBackendInit {
+            info: Some(serde_json::json!({
+                "status": "error",
+                "requested": other,
+                "reason": "unknown backend; valid values: none, auto, cvitek",
+            })),
+            #[cfg(feature = "cvitek")]
+            handle: None,
+        },
+    }
+}
+
+#[cfg(feature = "cvitek")]
+fn init_cvitek_backend(
+    model_path: Option<&std::path::Path>,
+    requested: &str,
+) -> (serde_json::Value, Option<BackendHandle>) {
+    let path = match model_path {
+        Some(p) => p.to_path_buf(),
+        None => {
+            return (
+                serde_json::json!({
+                    "status": "error",
+                    "requested": requested,
+                    "reason": "--backend cvitek requires --model <PATH>.cvimodel",
+                }),
+                None,
+            );
+        }
+    };
+
+    info!("Loading CviTek backend from {}", path.display());
+    let started = std::time::Instant::now();
+    match CviTekBackend::from_file(&path) {
+        Ok(backend) => {
+            let load_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let (major, minor) = backend.model_version();
+            let inputs_json: Vec<serde_json::Value> = backend
+                .inputs_info()
+                .into_iter()
+                .map(|(name, shape, dtype, qscale, zp)| {
+                    serde_json::json!({
+                        "name": name,
+                        "shape": shape.dims(),
+                        "dtype": dtype,
+                        "qscale": qscale,
+                        "zero_point": zp,
+                    })
+                })
+                .collect();
+            let outputs_json: Vec<serde_json::Value> = backend
+                .outputs_info()
+                .into_iter()
+                .map(|(name, shape, dtype, qscale, zp)| {
+                    serde_json::json!({
+                        "name": name,
+                        "shape": shape.dims(),
+                        "dtype": dtype,
+                        "qscale": qscale,
+                        "zero_point": zp,
+                    })
+                })
+                .collect();
+            info!(
+                "CviTek backend ready (target={}, version={}.{}, {:.1} ms)",
+                backend.target(),
+                major,
+                minor,
+                load_ms,
+            );
+            // Phase 2.2a: retain the live handle for request-driven dispatch.
+            let handle: BackendHandle = std::sync::Arc::new(backend);
+            (
+                serde_json::json!({
+                    "status": "ready",
+                    "backend": "cvitek",
+                    "model_path": path.display().to_string(),
+                    "target": "cv1812cp",
+                    "model_target": {
+                        "major": major,
+                        "minor": minor,
+                    },
+                    "load_ms": load_ms,
+                    "inputs": inputs_json,
+                    "outputs": outputs_json,
+                    "note": "Phase 2.2a — live handle retained; POST /api/v1/backend/run dispatches inference. Tick task integration lands in Phase 2.2c with a CSI-input model.",
+                }),
+                Some(handle),
+            )
+        }
+        Err(e) => {
+            warn!("CviTek backend init failed: {e}");
+            (
+                serde_json::json!({
+                    "status": "error",
+                    "backend": "cvitek",
+                    "model_path": path.display().to_string(),
+                    "reason": e.to_string(),
+                }),
+                None,
+            )
+        }
+    }
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -4733,11 +5058,31 @@ async fn main() {
     };
 
     // Load trained model via --model (uses progressive loading if --progressive set)
+    //
+    // StalyaTech RuView Phase 2.1.1: when the caller explicitly opted into a
+    // non-RVF NN backend (e.g. `--backend cvitek` with a `.cvimodel` file),
+    // skip the RVF ProgressiveLoader path entirely.  Otherwise the loader
+    // would try to parse the cvimodel file as an RVF container, fail on the
+    // magic check (cvimodel starts with `vCim` = 0x4D697643), and emit a
+    // misleading ERROR log line even though the cvitek path keeps working.
+    let backend_is_cvitek = args.backend.eq_ignore_ascii_case("cvitek")
+        || (args.backend.eq_ignore_ascii_case("auto")
+            && args.model.as_deref().is_some_and(|p| {
+                p.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("cvimodel"))
+            }));
+
     let model_path = args.model.as_ref().or(args.load_rvf.as_ref());
     let mut progressive_loader: Option<ProgressiveLoader> = None;
     let mut model_loaded = false;
     if let Some(mp) = model_path {
-        if args.progressive || args.model.is_some() {
+        let is_cvimodel = mp.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("cvimodel"));
+        if backend_is_cvitek || is_cvimodel {
+            info!(
+                "Skipping RVF progressive loader for {} (handled by --backend {})",
+                mp.display(),
+                if backend_is_cvitek { args.backend.as_str() } else { "cvitek" }
+            );
+        } else if args.progressive || args.model.is_some() {
             info!("Loading trained model (progressive) from {}", mp.display());
             match std::fs::read(mp) {
                 Ok(data) => match ProgressiveLoader::new(&data) {
@@ -4765,6 +5110,18 @@ async fn main() {
     let initial_models = scan_model_files();
     let initial_recordings = scan_recording_files();
     info!("Discovered {} model files, {} recording files", initial_models.len(), initial_recordings.len());
+
+    // StalyaTech RuView Phase 2.1 / 2.2a: bring up the optional NN
+    // inference backend (CviTek TPU on SG2000).  Phase 2.1 only published
+    // a diagnostic JSON; Phase 2.2a additionally retains the live handle
+    // so POST /api/v1/backend/run can dispatch inference on demand.
+    let backend_init = init_inference_backend(
+        args.backend.as_str(),
+        args.model.as_deref(),
+    );
+    let inference_backend_info = backend_init.info;
+    #[cfg(feature = "cvitek")]
+    let inference_backend_handle = backend_init.handle;
 
     let (tx, _) = broadcast::channel::<String>(256);
     let state: SharedState = Arc::new(RwLock::new(AppStateInner {
@@ -4841,6 +5198,9 @@ async fn main() {
         } else {
             None
         },
+        inference_backend_info,
+        #[cfg(feature = "cvitek")]
+        inference_backend: inference_backend_handle,
     }));
 
     // Start background tasks based on source
@@ -4900,6 +5260,10 @@ async fn main() {
         .route("/api/v1/vital-signs", get(vital_signs_endpoint))
         .route("/api/v1/edge-vitals", get(edge_vitals_endpoint))
         .route("/api/v1/wasm-events", get(wasm_events_endpoint))
+        // StalyaTech RuView Phase 2.1: NN inference backend diagnostic
+        .route("/api/v1/backend/info", get(backend_info))
+        // StalyaTech RuView Phase 2.2a: runtime dispatch (zero-input smoke run)
+        .route("/api/v1/backend/run", post(backend_run))
         // RVF model container info
         .route("/api/v1/model/info", get(model_info))
         // Progressive loading & SONA endpoints (Phase 7-8)
