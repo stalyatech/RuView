@@ -362,6 +362,10 @@ struct NodeState {
     /// Most recent novelty score in [0.0, 1.0] (0 = exact-match in bank,
     /// 1 = no overlap). Consumed by the model-wake gate downstream.
     pub(crate) last_novelty_score: Option<f32>,
+    /// Phase 2.2c — per-node phase mirror of `frame_history`.  Kept for
+    /// symmetry with multi-node fusion; the cvitek inference dispatch
+    /// currently feeds from the global `AppStateInner.phase_history`.
+    pub(crate) phase_history: VecDeque<Vec<f64>>,
 }
 
 /// Default EMA alpha for temporal keypoint smoothing (RuVector Phase 2).
@@ -421,6 +425,7 @@ impl NodeState {
                 ),
             ),
             last_novelty_score: None,
+            phase_history: VecDeque::with_capacity(FRAME_HISTORY_CAPACITY),
         }
     }
 
@@ -675,6 +680,19 @@ struct AppStateInner {
     /// when this binary was built with `--features cvitek`.
     #[cfg(feature = "cvitek")]
     inference_backend: Option<BackendHandle>,
+    /// StalyaTech RuView Phase 2.2c: phase mirror of `frame_history`.
+    /// ESP32 frames carry both amplitude and phase but only amplitude was
+    /// historically retained; the cvitek WiFi-DensePose scaffold consumes
+    /// both, so we now keep the matching phase window.  Capacity =
+    /// FRAME_HISTORY_CAPACITY (100 frames).
+    phase_history: VecDeque<Vec<f64>>,
+    /// StalyaTech RuView Phase 2.2c: latest 17-keypoint pose decoded from
+    /// the cvitek backend.  Inference runs every other tick (5 Hz) while
+    /// the broadcast loop fires at 10 Hz; this field caches the last good
+    /// result so every broadcast tick can serve fresh keypoints.  Stays
+    /// `None` until the first successful inference completes and is left
+    /// untouched on subsequent failures so the UI never flickers.
+    latest_keypoints: Option<Vec<[f64; 4]>>,
 }
 
 /// If no ESP32 frame arrives within this duration, source reverts to offline.
@@ -1709,6 +1727,16 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
         if s_write_pre.frame_history.len() > FRAME_HISTORY_CAPACITY {
             s_write_pre.frame_history.pop_front();
         }
+        // Phase 2.2c — phase mirror.
+        s_write_pre.phase_history.push_back(frame.phases.clone());
+        if s_write_pre.phase_history.len() > FRAME_HISTORY_CAPACITY {
+            s_write_pre.phase_history.pop_front();
+        }
+        // Phase 2.2c — dispatch cvitek inference every other tick.
+        #[cfg(feature = "cvitek")]
+        if seq % 2 == 0 {
+            spawn_cvitek_inference(state.clone());
+        }
         let sample_rate_hz = 1000.0 / tick_ms as f64;
         let (features, mut classification, breathing_rate_hz, sub_variances, raw_motion) =
             extract_features_from_frame(&frame, &s_write_pre.frame_history, sample_rate_hz);
@@ -1798,7 +1826,7 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
             signal_quality_score: sig_quality_score,
             quality_verdict: verdict_str,
             bssid_count: bssid_n,
-            pose_keypoints: None,
+            pose_keypoints: s.latest_keypoints.clone(),
             model_status: None,
             persons: None,
             estimated_persons: if est_persons > 0 { Some(est_persons) } else { None },
@@ -1871,6 +1899,11 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
     if s.frame_history.len() > FRAME_HISTORY_CAPACITY {
         s.frame_history.pop_front();
     }
+    // Phase 2.2c — phase mirror.
+    s.phase_history.push_back(frame.phases.clone());
+    if s.phase_history.len() > FRAME_HISTORY_CAPACITY {
+        s.phase_history.pop_front();
+    }
     let sample_rate_hz = 2.0_f64; // fallback tick ~ 500 ms => 2 Hz
     let (features, mut classification, breathing_rate_hz, sub_variances, raw_motion) =
         extract_features_from_frame(&frame, &s.frame_history, sample_rate_hz);
@@ -1937,7 +1970,7 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
         signal_quality_score: None,
         quality_verdict: None,
         bssid_count: None,
-        pose_keypoints: None,
+        pose_keypoints: s.latest_keypoints.clone(),
         model_status: None,
         persons: None,
         estimated_persons: if est_persons > 0 { Some(est_persons) } else { None },
@@ -3567,6 +3600,141 @@ async fn backend_info(State(state): State<SharedState>) -> Json<serde_json::Valu
     }
 }
 
+/// StalyaTech RuView Phase 2.2c: pack the latest `(amplitude, phase)`
+/// history pair into the input tensors the WiFi-DensePose scaffold expects.
+///
+/// The cvitek model takes two flat `[1, 50400]` inputs — one for amplitude
+/// and one for phase — laid out as `100 frames × 9 antenna pairs × 56
+/// subcarriers`.  ESP32 only emits a single antenna pair per frame, so we
+/// replicate the same `[100, 56]` slice across the 9-link axis (the
+/// scaffold has no per-link weight specialisation; this is the
+/// information-preserving placement for current hardware).
+///
+/// If fewer than 100 frames are available, the front of the window is
+/// zero-padded so cold boots still produce a well-formed tensor.  Short
+/// subcarrier vectors (less than 56 entries) are zero-padded too, which
+/// can happen on the very first frame from an ESP32 node before parser
+/// stabilises.
+#[cfg(feature = "cvitek")]
+fn build_csi_input_tensor(
+    amp_hist: &VecDeque<Vec<f64>>,
+    phase_hist: &VecDeque<Vec<f64>>,
+) -> wifi_densepose_nn::NnResult<HashMap<String, NnTensor>> {
+    use wifi_densepose_nn::NnError;
+
+    const N_FRAMES: usize = 100;
+    const N_LINKS: usize = 9;
+    const N_SUBC: usize = 56;
+    const FLAT: usize = N_FRAMES * N_LINKS * N_SUBC; // 50_400
+
+    // Fold one history (Vec of per-frame subcarrier vectors) into a flat
+    // [N_FRAMES * N_LINKS * N_SUBC] f32 buffer, zero-padding both axes.
+    let fold = |hist: &VecDeque<Vec<f64>>| -> Vec<f32> {
+        let mut out = vec![0.0_f32; FLAT];
+        // Take the most recent N_FRAMES, left-pad the earlier slots.
+        let start = N_FRAMES.saturating_sub(hist.len());
+        for (rel_idx, frame) in hist.iter().rev().take(N_FRAMES).rev().enumerate() {
+            let t = start + rel_idx;
+            for s in 0..N_SUBC.min(frame.len()) {
+                let v = frame[s] as f32;
+                // Replicate the single antenna pair across all 9 link slots.
+                for link in 0..N_LINKS {
+                    let idx = (t * N_LINKS + link) * N_SUBC + s;
+                    out[idx] = v;
+                }
+            }
+        }
+        out
+    };
+
+    let amp_flat = fold(amp_hist);
+    let phase_flat = fold(phase_hist);
+
+    // We deliberately stay off `ndarray::Array4::from_shape_vec` because
+    // ndarray isn't a direct dep of sensing-server.  `zeros_4d` builds a
+    // contiguous row-major Array4 we can fill with a flat slice via the
+    // public tensor API.
+    let mut amp_tensor = NnTensor::zeros_4d([1, FLAT, 1, 1]);
+    amp_tensor
+        .as_array4_mut()?
+        .as_slice_mut()
+        .ok_or_else(|| NnError::tensor_op("amplitude tensor is non-contiguous"))?
+        .copy_from_slice(&amp_flat);
+
+    let mut phase_tensor = NnTensor::zeros_4d([1, FLAT, 1, 1]);
+    phase_tensor
+        .as_array4_mut()?
+        .as_slice_mut()
+        .ok_or_else(|| NnError::tensor_op("phase tensor is non-contiguous"))?
+        .copy_from_slice(&phase_flat);
+
+    let mut inputs = HashMap::new();
+    inputs.insert("amplitude".to_string(), amp_tensor);
+    inputs.insert("phase".to_string(), phase_tensor);
+    Ok(inputs)
+}
+
+/// StalyaTech RuView Phase 2.2c: decode the cvitek scaffold's keypoint
+/// heatmap output into the `SensingUpdate.pose_keypoints` wire format.
+///
+/// The output is a `[1, 17, H, W]` heatmap (H = W = 56 in the scaffold).
+/// For each of the 17 COCO keypoints, we take the spatial argmax and
+/// emit `[x, y, z, conf]` with `x, y ∈ [0, 1]` (normalised grid index)
+/// and `conf = sigmoid(peak_logit)`.  z is fixed at 0 — WiFi sensing is
+/// inherently 2D unless a depth head ships.
+///
+/// We locate the keypoint head by shape (`[_, 17, _, _]`) rather than by
+/// name because tpu-mlir rewrites output names at deploy time
+/// (`keypoints` becomes `keypoints_Resize` after the final upsample).
+#[cfg(feature = "cvitek")]
+fn decode_keypoint_heatmap(
+    outputs: &HashMap<String, NnTensor>,
+) -> wifi_densepose_nn::NnResult<Vec<[f64; 4]>> {
+    use wifi_densepose_nn::NnError;
+
+    // Find the [_, 17, H, W] head — keypoint heatmap.
+    let (heatmap_arr, h, w) = outputs
+        .iter()
+        .find_map(|(_, t)| {
+            let dims = t.shape().dims().to_vec();
+            if dims.len() == 4 && dims[1] == 17 {
+                t.as_array4().ok().map(|arr| (arr, dims[2], dims[3]))
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            NnError::inference("no keypoint output found ([_,17,H,W] shape)".to_string())
+        })?;
+
+    let mut keypoints = Vec::with_capacity(17);
+    for k in 0..17 {
+        // Slice [0, k, :, :] — find the (y, x) of the peak value.
+        let mut peak: f32 = f32::NEG_INFINITY;
+        let mut peak_y: usize = 0;
+        let mut peak_x: usize = 0;
+        for y in 0..h {
+            for x in 0..w {
+                let v = heatmap_arr[[0, k, y, x]];
+                if v > peak {
+                    peak = v;
+                    peak_y = y;
+                    peak_x = x;
+                }
+            }
+        }
+        // Normalise grid coords to [0, 1].  Empty grid (h or w == 0) is
+        // pathological but guards against div-by-zero.
+        let nx = if w > 1 { peak_x as f64 / (w as f64 - 1.0) } else { 0.0 };
+        let ny = if h > 1 { peak_y as f64 / (h as f64 - 1.0) } else { 0.0 };
+        // Logit -> [0,1] via sigmoid.  `peak` can be -inf only if the
+        // heatmap is empty (h*w == 0), already trapped above.
+        let conf = 1.0 / (1.0 + (-peak as f64).exp());
+        keypoints.push([nx, ny, 0.0, conf]);
+    }
+    Ok(keypoints)
+}
+
 /// StalyaTech RuView Phase 2.2a: dispatch a single inference pass through
 /// the live backend handle with a zero-filled input tensor (built from
 /// the runtime-reported input shape) and return latency + per-output
@@ -3980,7 +4148,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         signal_quality_score: None,
                         quality_verdict: None,
                         bssid_count: None,
-                        pose_keypoints: None,
+                        pose_keypoints: s.latest_keypoints.clone(),
                         model_status: None,
                         persons: None,
                         estimated_persons: if total_persons > 0 { Some(total_persons) } else { None },
@@ -4043,6 +4211,11 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     if s.frame_history.len() > FRAME_HISTORY_CAPACITY {
                         s.frame_history.pop_front();
                     }
+                    // Phase 2.2c — global phase mirror for cvitek inference.
+                    s.phase_history.push_back(frame.phases.clone());
+                    if s.phase_history.len() > FRAME_HISTORY_CAPACITY {
+                        s.phase_history.pop_front();
+                    }
 
                     // ── Per-node processing (issue #249) ──────────────────
                     // Process entirely within per-node state so different
@@ -4067,6 +4240,11 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     ns.frame_history.push_back(frame.amplitudes.clone());
                     if ns.frame_history.len() > FRAME_HISTORY_CAPACITY {
                         ns.frame_history.pop_front();
+                    }
+                    // Phase 2.2c — per-node phase mirror.
+                    ns.phase_history.push_back(frame.phases.clone());
+                    if ns.phase_history.len() > FRAME_HISTORY_CAPACITY {
+                        ns.phase_history.pop_front();
                     }
 
                     let sample_rate_hz = 1000.0 / 500.0_f64;
@@ -4204,7 +4382,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         signal_quality_score: None,
                         quality_verdict: None,
                         bssid_count: None,
-                        pose_keypoints: None,
+                        pose_keypoints: s.latest_keypoints.clone(),
                         model_status: None,
                         persons: None,
                         estimated_persons: if total_persons > 0 { Some(total_persons) } else { None },
@@ -4273,6 +4451,22 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
         if s.frame_history.len() > FRAME_HISTORY_CAPACITY {
             s.frame_history.pop_front();
         }
+        // Phase 2.2c — phase mirror.
+        s.phase_history.push_back(frame.phases.clone());
+        if s.phase_history.len() > FRAME_HISTORY_CAPACITY {
+            s.phase_history.pop_front();
+        }
+
+        // Phase 2.2c — kick a cvitek inference run every other tick (5 Hz at
+        // tick_ms=100).  `spawn_cvitek_inference` enqueues a tokio task that
+        // takes its own read lock; the body of that task won't run until we
+        // drop our write lock at the end of this tick, so we can fire it
+        // here without releasing the lock.  This mirrors the hook in
+        // `broadcast_tick_task` for the esp32 path.
+        #[cfg(feature = "cvitek")]
+        if tick % 2 == 0 {
+            spawn_cvitek_inference(state.clone());
+        }
 
         let sample_rate_hz = 1000.0 / tick_ms as f64;
         let (features, mut classification, breathing_rate_hz, sub_variances, raw_motion) =
@@ -4336,7 +4530,7 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
             signal_quality_score: None,
             quality_verdict: None,
             bssid_count: None,
-            pose_keypoints: None,
+            pose_keypoints: s.latest_keypoints.clone(),
             model_status: if s.model_loaded {
                 Some(serde_json::json!({
                     "loaded": true,
@@ -4378,9 +4572,22 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
 
 async fn broadcast_tick_task(state: SharedState, tick_ms: u64) {
     let mut interval = tokio::time::interval(Duration::from_millis(tick_ms));
+    let mut tick: u64 = 0;
 
     loop {
         interval.tick().await;
+        tick = tick.wrapping_add(1);
+
+        // Phase 2.2c — every other tick (5 Hz given a 100 ms tick), kick a
+        // cvitek inference run.  Latency is ~106 ms, longer than a single
+        // tick, so we dispatch off-reactor with `spawn_blocking` and never
+        // await it here — the result lands in `AppState.latest_keypoints`
+        // and gets picked up by the next SensingUpdate JSON.
+        #[cfg(feature = "cvitek")]
+        if tick % 2 == 0 {
+            spawn_cvitek_inference(state.clone());
+        }
+
         let s = state.read().await;
         if let Some(ref update) = s.latest_update {
             if s.tx.receiver_count() > 0 {
@@ -4392,6 +4599,77 @@ async fn broadcast_tick_task(state: SharedState, tick_ms: u64) {
             }
         }
     }
+}
+
+/// Phase 2.2c — fire an async inference run if the cvitek backend is loaded
+/// and we have at least one frame in the history.  Snapshots inputs under
+/// a read lock, drops the lock before calling `Backend::run`, and finally
+/// writes the decoded keypoints into `AppState.latest_keypoints` under a
+/// short-held write lock.
+///
+/// Errors are logged at `warn` (run/decode) or `debug` (no-op cases like
+/// empty history) and never propagate; the previous `latest_keypoints`
+/// value is left in place so transient failures do not blank the UI.
+#[cfg(feature = "cvitek")]
+fn spawn_cvitek_inference(state: SharedState) {
+    tokio::spawn(async move {
+        let (backend, amp_hist, phase_hist) = {
+            let s = state.read().await;
+            let Some(ref backend) = s.inference_backend else {
+                return; // no backend loaded; --backend cvitek not in effect
+            };
+            if s.frame_history.is_empty() {
+                tracing::trace!("Phase 2.2c skipped — empty frame_history");
+                return;
+            }
+            (
+                backend.clone(),
+                s.frame_history.clone(),
+                s.phase_history.clone(),
+            )
+        };
+
+        let inputs = match build_csi_input_tensor(&amp_hist, &phase_hist) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Phase 2.2c build_csi_input_tensor failed: {e}");
+                return;
+            }
+        };
+
+        let started = std::time::Instant::now();
+        let join_res = tokio::task::spawn_blocking(move || backend.run(inputs)).await;
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        let outputs = match join_res {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                tracing::warn!("Phase 2.2c backend.run failed: {e}");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("Phase 2.2c join error: {e}");
+                return;
+            }
+        };
+
+        let kps = match decode_keypoint_heatmap(&outputs) {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::warn!("Phase 2.2c heatmap decode failed: {e}");
+                return;
+            }
+        };
+
+        tracing::debug!(
+            "Phase 2.2c inference {:.1} ms ({} keypoints)",
+            elapsed_ms,
+            kps.len()
+        );
+
+        let mut s = state.write().await;
+        s.latest_keypoints = Some(kps);
+    });
 }
 
 // ── StalyaTech RuView Phase 2.1: NN backend init ─────────────────────────────
@@ -5201,6 +5479,10 @@ async fn main() {
         inference_backend_info,
         #[cfg(feature = "cvitek")]
         inference_backend: inference_backend_handle,
+        // Phase 2.2c — populated by udp/windows/simulated tasks and consumed
+        // by the cvitek tick-task inference dispatch.
+        phase_history: VecDeque::new(),
+        latest_keypoints: None,
     }));
 
     // Start background tasks based on source
