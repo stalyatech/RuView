@@ -274,13 +274,32 @@ class SensingService {
   /**
    * Fetch `/api/v1/status` to find out if the server is using real
    * hardware or simulation. Called once on WebSocket open.
+   *
+   * StalyaTech RuView patch: `/api/v1/status` only reports the configured
+   * input MODE (esp32 / wifi / simulate), not whether any nodes are
+   * actually connected.  When the mode is a hardware mode (esp32 / wifi)
+   * we also fetch `/api/v1/nodes` and treat node_count==0 as
+   * "server-simulated" so the banner doesn't lie ("ESP32 Hardware
+   * Connected") while there are zero ESP32 nodes associated.
    */
   async _detectServerSource() {
     try {
       const resp = await fetch('/api/v1/status');
       if (resp.ok) {
         const json = await resp.json();
-        this._applyServerSource(json.source);
+        let nodeCount = null;
+        if (json.source === 'esp32' || json.source === 'wifi') {
+          try {
+            const nresp = await fetch('/api/v1/nodes');
+            if (nresp.ok) {
+              const nj = await nresp.json();
+              nodeCount = (nj && typeof nj.total === 'number')
+                ? nj.total
+                : (Array.isArray(nj && nj.nodes) ? nj.nodes.length : 0);
+            }
+          } catch { /* tolerate — leave nodeCount null */ }
+        }
+        this._applyServerSource(json.source, nodeCount);
       } else {
         // Can't reach status endpoint — assume live until first frame tells us
         this._setDataSource('live');
@@ -292,11 +311,22 @@ class SensingService {
 
   /**
    * Map a raw server source string to the UI data-source label.
+   *
+   * StalyaTech RuView patch: optional `nodeCount` argument disambiguates
+   * "hardware mode with 0 connected nodes" (treat as server-simulated)
+   * from "hardware mode with live nodes" (treat as live).  `null` means
+   * unknown → fall back to the original mode-only mapping.
    */
-  _applyServerSource(rawSource) {
+  _applyServerSource(rawSource, nodeCount = null) {
     this._serverSource = rawSource;
-    if (rawSource === 'esp32' || rawSource === 'wifi' || rawSource === 'live') {
-      this._setDataSource('live');
+    const isHardwareMode = (rawSource === 'esp32' || rawSource === 'wifi' || rawSource === 'live');
+    if (isHardwareMode) {
+      if (nodeCount !== null && nodeCount === 0) {
+        // Hardware mode configured but no nodes attached — be honest in UX.
+        this._setDataSource('server-simulated');
+      } else {
+        this._setDataSource('live');
+      }
     } else if (rawSource === 'simulated' || rawSource === 'simulate') {
       this._setDataSource('server-simulated');
     } else {
@@ -317,10 +347,13 @@ class SensingService {
 
     // Track the server's source field from each frame so the UI
     // can react if the server switches between esp32 ↔ simulated at runtime.
+    // StalyaTech RuView patch: pass frame's nodes.length so the live/sim
+    // banner reflects connected-hardware reality, not just configured mode.
     if (data.source && this._state === 'connected') {
       const raw = data.source;
       if (raw !== this._serverSource) {
-        this._applyServerSource(raw);
+        const nodeCount = Array.isArray(data.nodes) ? data.nodes.length : null;
+        this._applyServerSource(raw, nodeCount);
       }
     }
 
