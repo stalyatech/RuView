@@ -8,12 +8,14 @@
 
 import { sensingService } from '../services/sensing.service.js';
 import { GaussianSplatRenderer } from './gaussian-splats.js';
+import { PoseKeypointsView } from './PoseKeypointsView.js';
 
 export class SensingTab {
   /** @param {HTMLElement} container - the #sensing section element */
   constructor(container) {
     this.container = container;
     this.splatRenderer = null;
+    this.poseView = null;
     this._unsubData = null;
     this._unsubState = null;
     this._resizeObserver = null;
@@ -24,6 +26,7 @@ export class SensingTab {
     this._buildDOM();
     await this._loadThree();
     this._initSplatRenderer();
+    this._initPoseView();
     this._connectService();
     this._setupResize();
   }
@@ -116,6 +119,10 @@ export class SensingTab {
             </p>
           </div>
 
+          <!-- Pose keypoints card — populated by PoseKeypointsView from
+               sensingService onData (pose_keypoints from cvitek backend). -->
+          <div class="sensing-card sensing-pose-card" id="sensingPoseCard"></div>
+
           <!-- Node Status -->
           <div class="sensing-card" id="sensingNodeCards">
             <div class="sensing-card-title">NODE STATUS</div>
@@ -179,6 +186,21 @@ export class SensingTab {
     } catch (e) {
       console.error('[SensingTab] Failed to init splat renderer:', e);
       viewport.innerHTML = '<div class="sensing-loading">3D rendering unavailable</div>';
+    }
+  }
+
+  // ---- Pose keypoints view -----------------------------------------------
+
+  _initPoseView() {
+    const card = this.container.querySelector('#sensingPoseCard');
+    if (!card) return;
+    try {
+      this.poseView = new PoseKeypointsView(card);
+      this.poseView.init();
+    } catch (e) {
+      console.error('[SensingTab] Failed to init pose view:', e);
+      card.innerHTML = '<div class="sensing-card-title">Pose Keypoints</div>' +
+                       '<p class="pkv-note">render failed: ' + e.message + '</p>';
     }
   }
 
@@ -397,6 +419,7 @@ export class SensingTab {
     if (this._unsubState) this._unsubState();
     if (this._resizeObserver) this._resizeObserver.disconnect();
     if (this.splatRenderer) this.splatRenderer.dispose();
+    if (this.poseView) this.poseView.dispose();
     sensingService.stop();
   }
 }
