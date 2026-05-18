@@ -1,8 +1,14 @@
 //! Vital sign detection from WiFi CSI data.
 //!
 //! Implements breathing rate (0.1-0.5 Hz) and heart rate (0.8-2.0 Hz)
-//! estimation using FFT-based spectral analysis on CSI amplitude and phase
-//! time series. Designed per ADR-021 (rvdna vital sign pipeline).
+//! estimation using FFT-based spectral analysis on CSI amplitude time series.
+//!
+//! The detector analyses **each subcarrier independently**: respiration is a
+//! frequency-selective effect (a chest-wall path-length change rotates each
+//! subcarrier's phase differently), so averaging all subcarriers into one
+//! mean-amplitude series — as a naive detector does — cancels most of the
+//! signal.  Instead we band-pass + FFT every subcarrier, then fuse the
+//! strongest, mutually-agreeing ones.
 //!
 //! All math is pure Rust -- no external FFT crate required. Uses a radix-2
 //! DIT FFT for buffers zero-padded to power-of-two length. A windowed-sinc
@@ -24,12 +30,21 @@ const BREATHING_MAX_HZ: f64 = 0.5; // 30 BPM
 const HEARTBEAT_MIN_HZ: f64 = 0.667; // 40 BPM
 const HEARTBEAT_MAX_HZ: f64 = 2.0; // 120 BPM
 
-/// Minimum number of samples before attempting extraction.
-const MIN_BREATHING_SAMPLES: usize = 40; // ~2s at 20 Hz
-const MIN_HEARTBEAT_SAMPLES: usize = 30; // ~1.5s at 20 Hz
-
 /// Peak-to-mean ratio threshold for confident detection.
 const CONFIDENCE_THRESHOLD: f64 = 2.0;
+
+/// How often (in frames) the spectral estimate is recomputed.  Per-subcarrier
+/// analysis is costly on the SG2000's CPU, so recompute only every ~8 s — far
+/// more often would peg the core and wedge the whole device.
+const RECOMPUTE_EVERY: u32 = 96;
+
+/// Maximum number of subcarriers analysed per recompute.  A full 64-subcarrier
+/// sweep is too heavy for the SG2000; an evenly-strided subset is plenty for a
+/// robust median estimate.
+const MAX_ANALYZED: usize = 16;
+
+/// Rolling analysis window length, in seconds.
+const WINDOW_SECS: f64 = 30.0;
 
 // ── Output types ───────────────────────────────────────────────────────────
 
@@ -62,154 +77,176 @@ impl Default for VitalSigns {
 
 // ── Detector ───────────────────────────────────────────────────────────────
 
-/// Stateful vital sign detector. Maintains rolling buffers of CSI amplitude
-/// data and extracts breathing and heart rate via spectral analysis.
+/// Stateful vital sign detector.
+///
+/// Keeps a per-subcarrier amplitude time series and extracts breathing / heart
+/// rate by analysing each subcarrier independently in the band of interest,
+/// then fusing the strongest, mutually-agreeing subcarriers.
 #[allow(dead_code)]
 pub struct VitalSignDetector {
-    /// Rolling buffer of mean-amplitude samples for breathing detection.
-    breathing_buffer: VecDeque<f64>,
-    /// Rolling buffer of phase-variance samples for heartbeat detection.
-    heartbeat_buffer: VecDeque<f64>,
+    /// One amplitude time-series buffer per subcarrier.
+    sub_buffers: Vec<VecDeque<f64>>,
     /// CSI frame arrival rate in Hz.
     sample_rate: f64,
-    /// Window duration for breathing FFT in seconds.
-    breathing_window_secs: f64,
-    /// Window duration for heartbeat FFT in seconds.
-    heartbeat_window_secs: f64,
-    /// Maximum breathing buffer capacity (samples).
-    breathing_capacity: usize,
-    /// Maximum heartbeat buffer capacity (samples).
-    heartbeat_capacity: usize,
-    /// Running frame count for signal quality estimation.
+    /// Rolling window length in samples (covers `WINDOW_SECS`).
+    capacity: usize,
+    /// Running frame count.
     frame_count: u64,
+    /// Frames since the spectral estimate was last recomputed.
+    recompute_ctr: u32,
+    /// Cached most-recent result (recomputed every `RECOMPUTE_EVERY` frames).
+    last: VitalSigns,
 }
 
 impl VitalSignDetector {
     /// Create a new detector with the given CSI sample rate (Hz).
-    ///
-    /// Typical sample rates:
-    /// - ESP32 CSI: 20-100 Hz
-    /// - Windows WiFi RSSI: 2 Hz (insufficient for heartbeat)
-    /// - Simulation: 2-20 Hz
     pub fn new(sample_rate: f64) -> Self {
-        let breathing_window_secs = 30.0;
-        let heartbeat_window_secs = 15.0;
-        let breathing_capacity = (sample_rate * breathing_window_secs) as usize;
-        let heartbeat_capacity = (sample_rate * heartbeat_window_secs) as usize;
-
+        let capacity = ((sample_rate * WINDOW_SECS) as usize).max(1);
         Self {
-            breathing_buffer: VecDeque::with_capacity(breathing_capacity.max(1)),
-            heartbeat_buffer: VecDeque::with_capacity(heartbeat_capacity.max(1)),
+            sub_buffers: Vec::new(),
             sample_rate,
-            breathing_window_secs,
-            heartbeat_window_secs,
-            breathing_capacity: breathing_capacity.max(1),
-            heartbeat_capacity: heartbeat_capacity.max(1),
+            capacity,
             frame_count: 0,
+            recompute_ctr: 0,
+            last: VitalSigns::default(),
         }
     }
 
-    /// Process one CSI frame and return updated vital signs.
+    /// Update the assumed CSI frame rate (Hz).  The FFT frequency→BPM
+    /// conversion scales directly with this, so it must track the real
+    /// (measured) ESP32 delivery rate.
+    pub fn set_sample_rate(&mut self, hz: f64) {
+        if hz.is_finite() && hz > 1.0 {
+            self.sample_rate = hz;
+        }
+    }
+
+    /// Process one CSI frame and return the latest vital signs.
     ///
     /// `amplitude` - per-subcarrier amplitude values for this frame.
-    /// `phase` - per-subcarrier phase values for this frame.
-    ///
-    /// The detector extracts two aggregate features per frame:
-    /// 1. Mean amplitude (breathing signal -- chest movement modulates path loss)
-    /// 2. Phase variance across subcarriers (heartbeat signal -- subtle phase shifts)
+    /// `phase` - per-subcarrier phase values (unused: the per-subcarrier
+    /// amplitude series already carries the respiration signal, and ESP32
+    /// phase is too noisy without calibration to help).
     pub fn process_frame(&mut self, amplitude: &[f64], phase: &[f64]) -> VitalSigns {
+        let _ = phase;
         self.frame_count += 1;
 
         if amplitude.is_empty() {
-            return VitalSigns::default();
+            return self.last.clone();
         }
 
-        // -- Feature 1: Mean amplitude for breathing detection --
-        // Respiratory chest displacement (1-5 mm) modulates CSI amplitudes
-        // across all subcarriers. Mean amplitude captures this well.
-        let n = amplitude.len() as f64;
-        let mean_amp: f64 = amplitude.iter().sum::<f64>() / n;
-
-        self.breathing_buffer.push_back(mean_amp);
-        while self.breathing_buffer.len() > self.breathing_capacity {
-            self.breathing_buffer.pop_front();
+        // (Re)allocate the per-subcarrier buffers when the subcarrier count
+        // changes (e.g. after a firmware CSI-config change).
+        if self.sub_buffers.len() != amplitude.len() {
+            self.sub_buffers = (0..amplitude.len())
+                .map(|_| VecDeque::with_capacity(self.capacity))
+                .collect();
         }
 
-        // -- Feature 2: Phase variance for heartbeat detection --
-        // Cardiac-induced body surface displacement is < 0.5 mm, producing
-        // tiny phase changes. Cross-subcarrier phase variance captures this
-        // more sensitively than amplitude alone.
-        let phase_var = if phase.len() > 1 {
-            let mean_phase: f64 = phase.iter().sum::<f64>() / phase.len() as f64;
-            phase
-                .iter()
-                .map(|p| (p - mean_phase).powi(2))
-                .sum::<f64>()
-                / phase.len() as f64
-        } else {
-            // Fallback: use amplitude high-pass residual when phase is unavailable
-            let half = amplitude.len() / 2;
-            if half > 0 {
-                let hi_mean: f64 =
-                    amplitude[half..].iter().sum::<f64>() / (amplitude.len() - half) as f64;
-                amplitude[half..]
-                    .iter()
-                    .map(|a| (a - hi_mean).powi(2))
-                    .sum::<f64>()
-                    / (amplitude.len() - half) as f64
-            } else {
-                0.0
+        for (buf, &a) in self.sub_buffers.iter_mut().zip(amplitude.iter()) {
+            buf.push_back(a);
+            while buf.len() > self.capacity {
+                buf.pop_front();
             }
-        };
-
-        self.heartbeat_buffer.push_back(phase_var);
-        while self.heartbeat_buffer.len() > self.heartbeat_capacity {
-            self.heartbeat_buffer.pop_front();
         }
 
-        // -- Extract vital signs --
-        let (breathing_rate, breathing_confidence) = self.extract_breathing();
-        let (heart_rate, heartbeat_confidence) = self.extract_heartbeat();
+        self.recompute_ctr += 1;
+        if self.recompute_ctr >= RECOMPUTE_EVERY {
+            self.recompute_ctr = 0;
+            self.last = self.recompute();
+        }
+        self.last.clone()
+    }
 
-        // -- Signal quality --
-        let signal_quality = self.compute_signal_quality(amplitude);
-
+    /// Recompute breathing + heart rate + signal quality from current buffers.
+    fn recompute(&self) -> VitalSigns {
+        let (breathing_rate_bpm, breathing_confidence) =
+            self.analyze_band(BREATHING_MIN_HZ, BREATHING_MAX_HZ);
+        let (heart_rate_bpm, heartbeat_confidence) =
+            self.analyze_band(HEARTBEAT_MIN_HZ, HEARTBEAT_MAX_HZ);
+        let signal_quality = self.compute_signal_quality();
         VitalSigns {
-            breathing_rate_bpm: breathing_rate,
-            heart_rate_bpm: heart_rate,
+            breathing_rate_bpm,
+            heart_rate_bpm,
             breathing_confidence,
             heartbeat_confidence,
             signal_quality,
         }
     }
 
-    /// Extract breathing rate from the breathing buffer via FFT.
-    /// Returns (rate_bpm, confidence).
-    pub fn extract_breathing(&self) -> (Option<f64>, f64) {
-        if self.breathing_buffer.len() < MIN_BREATHING_SAMPLES {
+    /// Analyse every subcarrier in [min_hz, max_hz] and fuse the strongest,
+    /// mutually-agreeing ones.  Returns (rate_bpm, confidence).
+    fn analyze_band(&self, min_hz: f64, max_hz: f64) -> (Option<f64>, f64) {
+        // A sub-Hz estimate needs a decent slice of history.
+        let min_samples = ((self.sample_rate * 12.0) as usize).max(48);
+        let n_sub = self.sub_buffers.len();
+        if n_sub == 0 {
+            return (None, 0.0);
+        }
+        // Analyse at most MAX_ANALYZED evenly-strided subcarriers — a full
+        // sweep wedges the SG2000 CPU.
+        let stride = (n_sub / MAX_ANALYZED).max(1);
+        let mut results: Vec<(f64, f64)> = Vec::new(); // (bpm, peak_conf)
+
+        let mut idx = 0;
+        while idx < n_sub {
+            let buf = &self.sub_buffers[idx];
+            idx += stride;
+            if buf.len() < min_samples {
+                continue;
+            }
+            let n = buf.len() as f64;
+            let mean = buf.iter().sum::<f64>() / n;
+            if mean.abs() < 1e-6 {
+                continue; // dead subcarrier (DC / guard null)
+            }
+            let var = buf.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+            if var < 1e-6 {
+                continue; // perfectly flat — carries no information
+            }
+            // Detrend (remove DC).  `compute_fft_peak` already restricts the
+            // peak search to [min_hz, max_hz], so an explicit FIR band-pass —
+            // the expensive part — is unnecessary here.
+            let data: Vec<f64> = buf.iter().map(|x| x - mean).collect();
+            let (bpm, conf) = self.compute_fft_peak(&data, min_hz, max_hz);
+            if let Some(b) = bpm {
+                results.push((b, conf));
+            }
+        }
+
+        if results.len() < 3 {
             return (None, 0.0);
         }
 
-        let data: Vec<f64> = self.breathing_buffer.iter().copied().collect();
-        let filtered = bandpass_filter(&data, BREATHING_MIN_HZ, BREATHING_MAX_HZ, self.sample_rate);
-        self.compute_fft_peak(&filtered, BREATHING_MIN_HZ, BREATHING_MAX_HZ)
-    }
+        // Keep the subcarriers with the sharpest spectral peaks.
+        results.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let k = results.len().min(9);
+        let top = &results[..k];
 
-    /// Extract heart rate from the heartbeat buffer via FFT.
-    /// Returns (rate_bpm, confidence).
-    pub fn extract_heartbeat(&self) -> (Option<f64>, f64) {
-        if self.heartbeat_buffer.len() < MIN_HEARTBEAT_SAMPLES {
-            return (None, 0.0);
+        // Fuse: the median rate of the strong subcarriers is robust to a few
+        // noisy ones.  Confidence is dominated by *agreement* — real
+        // respiration drives many subcarriers to the same rate; noise does not.
+        let mut bpms: Vec<f64> = top.iter().map(|r| r.0).collect();
+        bpms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = bpms[bpms.len() / 2];
+        let agree = top.iter().filter(|r| (r.0 - median).abs() <= 2.0).count() as f64
+            / k as f64;
+        let mean_peak_conf = top.iter().map(|r| r.1).sum::<f64>() / k as f64;
+        let confidence = (agree * 0.7 + mean_peak_conf * 0.3).clamp(0.0, 1.0);
+
+        // A rate the strong subcarriers do not agree on is almost certainly
+        // noise — surface it but with a deliberately low confidence.
+        if agree < 0.4 {
+            return (Some(median), confidence.min(0.25));
         }
-
-        let data: Vec<f64> = self.heartbeat_buffer.iter().copied().collect();
-        let filtered = bandpass_filter(&data, HEARTBEAT_MIN_HZ, HEARTBEAT_MAX_HZ, self.sample_rate);
-        self.compute_fft_peak(&filtered, HEARTBEAT_MIN_HZ, HEARTBEAT_MAX_HZ)
+        (Some(median), confidence)
     }
 
-    /// Find the dominant frequency in `buffer` within the [min_hz, max_hz] band
-    /// using FFT. Returns (frequency_as_bpm, confidence).
-    pub fn compute_fft_peak(
+    /// Find the dominant frequency in a (band-pass-filtered) signal via FFT.
+    /// Returns (frequency_as_bpm, confidence-from-peak-sharpness).
+    fn compute_fft_peak(
         &self,
         buffer: &[f64],
         min_hz: f64,
@@ -305,58 +342,55 @@ impl VitalSignDetector {
         }
     }
 
-    /// Overall signal quality based on amplitude statistics.
-    fn compute_signal_quality(&self, amplitude: &[f64]) -> f64 {
-        if amplitude.is_empty() {
+    /// Overall signal quality: how full the window is and how many subcarriers
+    /// carry a non-flat (informative) signal.
+    fn compute_signal_quality(&self) -> f64 {
+        if self.sub_buffers.is_empty() {
             return 0.0;
         }
+        let fill = self.sub_buffers.first().map(|b| b.len()).unwrap_or(0) as f64
+            / self.capacity.max(1) as f64;
 
-        let n = amplitude.len() as f64;
-        let mean = amplitude.iter().sum::<f64>() / n;
-
-        if mean < f64::EPSILON {
-            return 0.0;
+        let mut live = 0usize;
+        let mut total = 0usize;
+        for buf in &self.sub_buffers {
+            if buf.len() < 8 {
+                continue;
+            }
+            total += 1;
+            let n = buf.len() as f64;
+            let mean = buf.iter().sum::<f64>() / n;
+            if mean.abs() < 1e-6 {
+                continue;
+            }
+            let var = buf.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+            if var > 1e-6 {
+                live += 1;
+            }
         }
-
-        let variance = amplitude.iter().map(|a| (a - mean).powi(2)).sum::<f64>() / n;
-        let cv = variance.sqrt() / mean; // coefficient of variation
-
-        // Good signal: moderate CV (some variation from body motion, not pure noise).
-        // - Too low CV (~0) = static, no person present
-        // - Too high CV (>1) = noisy/unstable signal
-        // Sweet spot around 0.05-0.3
-        let quality = if cv < 0.01 {
-            cv / 0.01 * 0.3 // very low variation => low quality
-        } else if cv < 0.3 {
-            0.3 + 0.7 * (1.0 - ((cv - 0.15) / 0.15).abs()).max(0.0) // peak around 0.15
+        let live_frac = if total > 0 {
+            live as f64 / total as f64
         } else {
-            (1.0 - (cv - 0.3) / 0.7).clamp(0.1, 0.5) // too noisy
+            0.0
         };
-
-        // Factor in buffer fill level (need enough history for reliable estimates)
-        let fill =
-            (self.breathing_buffer.len() as f64) / (self.breathing_capacity as f64).max(1.0);
-        let fill_factor = fill.clamp(0.0, 1.0);
-
-        (quality * (0.3 + 0.7 * fill_factor)).clamp(0.0, 1.0)
+        (fill.clamp(0.0, 1.0) * 0.5 + live_frac * 0.5).clamp(0.0, 1.0)
     }
 
     /// Clear all internal buffers and reset state.
     pub fn reset(&mut self) {
-        self.breathing_buffer.clear();
-        self.heartbeat_buffer.clear();
+        for buf in &mut self.sub_buffers {
+            buf.clear();
+        }
         self.frame_count = 0;
+        self.recompute_ctr = 0;
+        self.last = VitalSigns::default();
     }
 
     /// Current buffer fill levels for diagnostics.
     /// Returns (breathing_len, breathing_capacity, heartbeat_len, heartbeat_capacity).
     pub fn buffer_status(&self) -> (usize, usize, usize, usize) {
-        (
-            self.breathing_buffer.len(),
-            self.breathing_capacity,
-            self.heartbeat_buffer.len(),
-            self.heartbeat_capacity,
-        )
+        let len = self.sub_buffers.first().map(|b| b.len()).unwrap_or(0);
+        (len, self.capacity, len, self.capacity)
     }
 }
 

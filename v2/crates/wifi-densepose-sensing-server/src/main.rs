@@ -259,6 +259,30 @@ struct SensingUpdate {
     /// Per-node feature breakdown for multi-node deployments.
     #[serde(skip_serializing_if = "Option::is_none")]
     node_features: Option<Vec<PerNodeFeatureInfo>>,
+    /// Server-side fall detection result (raw-CSI nodes only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fall: Option<FallInfo>,
+}
+
+/// Server-side fall detection result.  A fall is an impact-then-stillness
+/// signature: a sharp motion spike well above ambient activity, immediately
+/// followed by the subject going still while still present in the zone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FallInfo {
+    /// True while a confirmed fall is active (subject down after impact).
+    detected: bool,
+    /// State machine label: "normal" | "watching" | "fallen".
+    state: String,
+    /// Confidence of the fall classification [0,1].
+    confidence: f64,
+    /// Seconds the subject has been down since the confirmed impact.
+    seconds_down: f64,
+    /// Raw (pre-EMA) motion_band_power — fast signal, for tuning/telemetry.
+    motion_raw: f64,
+    /// Fast-EMA motion the detector state machine runs on.
+    motion_fast: f64,
+    /// Peak motion observed during the impact window.
+    peak: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -351,6 +375,44 @@ struct NodeState {
     // ── RuVector Phase 2: Temporal smoothing & coherence gating ──
     /// Previous frame's smoothed keypoint positions for EMA temporal smoothing.
     prev_keypoints: Option<Vec<[f64; 3]>>,
+    /// EMA-smoothed motion_band_power.  The raw per-window metric is still
+    /// noisy (still-subject baseline swings); this slow EMA flattens it so a
+    /// motion threshold can sit cleanly above the noise floor.
+    motion_bp_ema: f64,
+    /// Frames elapsed since the last above-threshold motion.  A person in
+    /// the room is never a perfect statue — any motion within the last
+    /// ~15 s keeps `presence` latched true so the skeleton/vitals do not
+    /// blink out while the subject merely stands still.
+    frames_since_motion: u32,
+    /// Detection/classification confidence written by `smooth_and_classify_node`
+    /// so per-node `build_node_features` reports the same value as the fused
+    /// top-level classification (not the legacy person-score).
+    current_confidence: f64,
+    /// Presence latch written by `smooth_and_classify_node`; mirrored into
+    /// per-node features so node and top-level presence never disagree.
+    current_presence: bool,
+    // ── Fall detection (activity-then-stillness state machine) ────────────
+    /// Fast EMA of raw motion_band_power (~0.2 s) — drives activity detection.
+    fall_motion_fast: f64,
+    /// Slow EMA of raw motion_band_power (~1.3 s) — rides over the fidget
+    /// spikes a downed-but-breathing subject still produces, so "sustained
+    /// stillness" can be judged robustly.
+    fall_motion_slow: f64,
+    /// Run-length of recent active frames; a fall must follow real activity.
+    fall_active_run: u32,
+    /// 0 = normal, 1 = watching (stillness candidate), 2 = fallen (confirmed).
+    fall_state: u8,
+    /// Frames elapsed in the watching state.
+    fall_watch_frames: u32,
+    /// Frames elapsed in the fallen state (drives `seconds_down`).
+    fall_down_frames: u32,
+    /// Activity run-length captured at the moment of the still transition —
+    /// a longer prior activity run raises fall confidence.
+    fall_peak: f64,
+    /// EMA of the measured CSI frame rate (Hz).  The ESP32 delivers ~11 Hz
+    /// but it is bursty; the vital-sign FFT needs the true rate or every
+    /// breathing/heart-rate reading is scaled wrong.
+    frame_rate_ema: f64,
     /// Rolling buffer of motion_energy values for coherence scoring (last 20 frames).
     motion_energy_history: VecDeque<f64>,
     /// Coherence score [0.0, 1.0]: low variance in motion_energy = high coherence.
@@ -415,6 +477,18 @@ impl NodeState {
             edge_vitals: None,
             latest_features: None,
             prev_keypoints: None,
+            motion_bp_ema: 0.0,
+            frames_since_motion: u32::MAX,
+            current_confidence: 0.98,
+            current_presence: false,
+            fall_motion_fast: 0.0,
+            fall_motion_slow: 0.0,
+            fall_active_run: 0,
+            fall_state: 0,
+            fall_watch_frames: 0,
+            fall_down_frames: 0,
+            fall_peak: 0.0,
+            frame_rate_ema: 11.0,
             motion_energy_history: VecDeque::with_capacity(COHERENCE_WINDOW),
             coherence_score: 1.0, // assume stable initially
             feature_history: Some(
@@ -553,12 +627,12 @@ fn build_node_features(
                 features,
                 classification: ClassificationInfo {
                     motion_level: ns.current_motion_level.clone(),
-                    presence: !matches!(ns.current_motion_level.as_str(), "absent"),
-                    confidence: ns.smoothed_person_score.clamp(0.0, 1.0),
+                    presence: ns.current_presence,
+                    confidence: ns.current_confidence.clamp(0.0, 1.0),
                 },
                 rssi_dbm: ns.rssi_history.back().copied().unwrap_or(0.0),
                 last_seen_ms,
-                frame_rate_hz: 0.0, // Computed elsewhere; not yet plumbed here.
+                frame_rate_hz: ns.frame_rate_ema,
                 stale,
                 novelty_score: ns.last_novelty_score,
             }
@@ -693,6 +767,54 @@ struct AppStateInner {
     /// `None` until the first successful inference completes and is left
     /// untouched on subsequent failures so the UI never flickers.
     latest_keypoints: Option<Vec<[f64; 4]>>,
+    /// Runtime motion-classification calibration:
+    /// `clean_motion = (motion_bp_ema - motion_cal_base) / motion_cal_scale`.
+    /// Loaded from `/opt/ruview/calibration.json` at startup and updated by
+    /// the UI calibration page.  Defaults match the Fix-A firmware.
+    motion_cal_base: f64,
+    motion_cal_scale: f64,
+    /// In-progress sample collection for the interactive calibration page.
+    calib: CalibrationState,
+}
+
+/// Collected motion samples for the interactive UI calibration page.
+#[derive(Default)]
+struct CalibrationState {
+    /// Class label currently being sampled (None when idle).
+    active_class: Option<String>,
+    /// Instant at which the current 10 s collection window ends.
+    collect_until: Option<std::time::Instant>,
+    /// Raw `motion_bp_ema` samples gathered, keyed by class label.
+    samples: std::collections::HashMap<String, Vec<f64>>,
+}
+
+/// Path the calibration (base/scale) is persisted to so it survives restarts.
+const CALIBRATION_PATH: &str = "/opt/ruview/calibration.json";
+
+/// Load persisted motion calibration; falls back to the Fix-A defaults.
+fn load_calibration() -> (f64, f64) {
+    let default = (5.0, 7.0);
+    let Ok(text) = std::fs::read_to_string(CALIBRATION_PATH) else {
+        return default;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return default;
+    };
+    let base = json.get("base").and_then(|v| v.as_f64()).unwrap_or(default.0);
+    let scale = json.get("scale").and_then(|v| v.as_f64()).unwrap_or(default.1);
+    if base.is_finite() && scale.is_finite() && scale > 0.5 {
+        (base, scale)
+    } else {
+        default
+    }
+}
+
+/// Persist motion calibration so it survives a restart.
+fn save_calibration(base: f64, scale: f64) {
+    let json = serde_json::json!({ "base": base, "scale": scale });
+    if let Ok(text) = serde_json::to_string_pretty(&json) {
+        let _ = std::fs::write(CALIBRATION_PATH, text);
+    }
 }
 
 /// If no ESP32 frame arrives within this duration, source reverts to offline.
@@ -1000,11 +1122,14 @@ fn generate_signal_field(
         }
     }
 
-    // Clamp and normalise to [0, 1].
+    // Clamp and normalise to [0, 1].  Round to 3 decimals: the field is a
+    // heat-map visualisation, so 0.001 precision is plenty — and it cuts the
+    // serialized JSON of these 400 values from ~7.6 KB to ~2 KB, which keeps
+    // the WebSocket light enough for a tablet on a marginal Wi-Fi link.
     let field_max = values.iter().cloned().fold(0.0f64, f64::max);
     let scale = if field_max > 1e-9 { 1.0 / field_max } else { 1.0 };
     for v in &mut values {
-        *v = (*v * scale).clamp(0.0, 1.0);
+        *v = ((*v * scale).clamp(0.0, 1.0) * 1000.0).round() / 1000.0;
     }
 
     SignalField {
@@ -1227,15 +1352,8 @@ fn extract_features_from_frame(
     // ── Spectral power ──
     let spectral_power: f64 = frame.amplitudes.iter().map(|a| a * a).sum::<f64>() / n;
 
-    // ── Motion band power (upper half of subcarriers, high spatial frequency) ──
+    // `half` splits the subcarrier array for the breathing-band metric below.
     let half = frame.amplitudes.len() / 2;
-    let motion_band_power = if half > 0 {
-        frame.amplitudes[half..].iter()
-            .map(|a| (a - mean_amp).powi(2))
-            .sum::<f64>() / (frame.amplitudes.len() - half) as f64
-    } else {
-        0.0
-    };
 
     // ── Breathing band power (lower half of subcarriers, low spatial frequency) ──
     let breathing_band_power = if half > 0 {
@@ -1263,22 +1381,67 @@ fn extract_features_from_frame(
     // ── Motion score: sliding-window temporal difference ──
     // Compare current frame against the most recent historical frame.
     // The difference is normalised by the mean amplitude to be scale-invariant.
-    let temporal_motion_score = if let Some(prev_frame) = frame_history.back() {
+    // Window-based temporal motion.  A single-frame diff (20-80 ms apart)
+    // is dominated by the ESP32's int8-CSI measurement noise — it made
+    // motion_band_power swing 1..91 while the subject stood still.  Instead
+    // we average the most recent `MOTION_WIN` frames and the `MOTION_WIN`
+    // frames before that, then diff the two means: per-frame noise cancels,
+    // sustained body motion survives.
+    const MOTION_WIN: usize = 5;
+    let ref_energy = mean_amp * mean_amp + 1e-9;
+    let temporal_motion_score = if frame_history.len() >= 2 * MOTION_WIN {
+        let n = frame_history.len();
+        // Per-frame mean-normalised window average.  Each frame is divided
+        // by its own mean amplitude *before* averaging — this cancels the
+        // AGC / CSI-scale drift (frame mean was bimodal ~16 vs ~27), so the
+        // window diff reflects genuine channel change (body motion), not
+        // gain change.  Normalised values sit around 1.0.
+        let window_mean = |start: usize| -> Vec<f64> {
+            let mut acc = vec![0.0_f64; n_sub];
+            for fi in start..start + MOTION_WIN {
+                let fr = &frame_history[fi];
+                let fmean = (fr.iter().sum::<f64>()
+                    / fr.len().max(1) as f64).max(1e-6);
+                for k in 0..n_sub.min(fr.len()) {
+                    acc[k] += fr[k] / fmean;
+                }
+            }
+            for v in acc.iter_mut() {
+                *v /= MOTION_WIN as f64;
+            }
+            acc
+        };
+        let recent = window_mean(n - MOTION_WIN);
+        let older = window_mean(n - 2 * MOTION_WIN);
+        // Windows are already unit-normalised, so the RMS diff IS the
+        // motion score — no division by mean_amp.
+        let diff_energy: f64 = (0..n_sub)
+            .map(|k| (recent[k] - older[k]).powi(2))
+            .sum::<f64>() / n_sub as f64;
+        diff_energy.sqrt().clamp(0.0, 1.0)
+    } else if let Some(prev_frame) = frame_history.iter().rev().nth(1) {
+        // Warm-up: not enough history for windows yet — single-frame diff.
         let n_cmp = n_sub.min(prev_frame.len());
         if n_cmp > 0 {
             let diff_energy: f64 = (0..n_cmp)
                 .map(|k| (frame.amplitudes[k] - prev_frame[k]).powi(2))
                 .sum::<f64>() / n_cmp as f64;
-            // Normalise by mean squared amplitude to get a dimensionless ratio.
-            let ref_energy = mean_amp * mean_amp + 1e-9;
             (diff_energy / ref_energy).sqrt().clamp(0.0, 1.0)
         } else {
             0.0
         }
     } else {
         // No history yet — fall back to intra-frame variance-based estimate.
-        (intra_variance / (mean_amp * mean_amp + 1e-9)).sqrt().clamp(0.0, 1.0)
+        (intra_variance / ref_energy).sqrt().clamp(0.0, 1.0)
     };
+
+    // Real temporal-motion metric.  The previous `motion_band_power` was the
+    // upper-half subcarrier *spatial* variance — a frequency-domain statistic
+    // that stayed ~360 whether the subject moved or not.  `temporal_motion_score`
+    // is the frame-to-frame change energy (verified to track the subject —
+    // ~2.1× still-vs-moving on raw CSI); we scale it to a ~0-100 range so the
+    // downstream /15 and /25 divisors land in a sensible [0,1] interval.
+    let motion_band_power = (temporal_motion_score * 100.0).clamp(0.0, 100.0);
 
     // Blend temporal motion with variance-based motion for robustness.
     // Also factor in motion_band_power and change_points for ESP32 real-world sensitivity.
@@ -1403,9 +1566,45 @@ fn smooth_and_classify_node(ns: &mut NodeState, raw: &mut ClassificationInfo, ra
                        + adjusted * MOTION_EMA_ALPHA;
     let sm = ns.smoothed_motion;
 
-    let candidate = raw_classify(sm);
+    // Presence latch — computed first because the motion class depends on
+    // it.  A still person still produces occasional motion (weight shift,
+    // breathing); any motion above a small floor resets the counter, and
+    // presence stays latched until ~8 s of total stillness, which in
+    // practice means the subject has left.
+    if sm > 0.04 {
+        ns.frames_since_motion = 0;
+    } else {
+        ns.frames_since_motion = ns.frames_since_motion.saturating_add(1);
+    }
+    let present = ns.frames_since_motion < PRESENCE_HOLD_FRAMES;
+    raw.presence = present;
 
-    if candidate == ns.current_motion_level {
+    // motion_level must agree with presence: while a person is present the
+    // class is never "absent" (which means "nobody here") — at most
+    // "present_still".  Only genuine absence yields "absent".
+    let candidate: String = if !present {
+        "absent".into()
+    } else if sm > 0.25 {
+        "active".into()
+    } else if sm > 0.12 {
+        "present_moving".into()
+    } else {
+        "present_still".into()
+    };
+
+    // Presence-boundary transitions bypass the debounce: `presence` is the
+    // authority, so `motion_level` must never contradict it even for a single
+    // frame.  Entering ("absent" -> present) snaps to "present_still";
+    // leaving (present -> !present) snaps straight to "absent".  Within-
+    // presence class changes (still <-> moving <-> active) still debounce.
+    let crosses_presence_boundary =
+        (present && ns.current_motion_level == "absent")
+        || (!present && ns.current_motion_level != "absent");
+    if crosses_presence_boundary {
+        ns.current_motion_level = candidate.clone();
+        ns.debounce_candidate = candidate;
+        ns.debounce_counter = 0;
+    } else if candidate == ns.current_motion_level {
         ns.debounce_counter = 0;
         ns.debounce_candidate = candidate;
     } else if candidate == ns.debounce_candidate {
@@ -1418,10 +1617,137 @@ fn smooth_and_classify_node(ns: &mut NodeState, raw: &mut ClassificationInfo, ra
         ns.debounce_candidate = candidate;
         ns.debounce_counter = 1;
     }
-
     raw.motion_level = ns.current_motion_level.clone();
-    raw.presence = sm > 0.03;
-    raw.confidence = (0.4 + sm * 0.6).clamp(0.0, 1.0);
+
+    // confidence = detection / classification confidence, NOT motion level.
+    //  - absent : how sure "nobody here" is — grows with sustained silence.
+    //  - present: detection is solid, so a high base; rises a little with
+    //    motion since stronger signals are easier to classify.
+    raw.confidence = if !present {
+        (ns.frames_since_motion as f64 / PRESENCE_HOLD_FRAMES as f64)
+            .clamp(0.55, 0.98)
+    } else {
+        (0.72 + sm * 0.5).clamp(0.0, 0.97)
+    };
+
+    // Mirror the final classification into NodeState so per-node
+    // `build_node_features` reports values identical to this fused result.
+    ns.current_presence = present;
+    ns.current_confidence = raw.confidence;
+}
+
+/// Frames of total stillness before `presence` drops — ~8 s at the
+/// ~17 Hz ESP32 CSI rate.  Short enough that leaving the room clears
+/// the latch quickly, long enough to ride out a still pose.
+const PRESENCE_HOLD_FRAMES: u32 = 136;
+
+// ── Fall detection tuning ───────────────────────────────────────────────────
+// Tuned from a controlled mattress-fall calibration run.  Key finding: on this
+// single-node hardware a cushioned fall peaks at motion_band_power ≈ 25-30 —
+// indistinguishable from walking (≈ 15-34) by magnitude.  The reliable
+// signature is instead a transition: real activity, then a sustained drop to
+// stillness while the subject stays present.  Calibration medians —
+// still ≈ 6, walking ≈ 13, downed-and-still ≈ 6-8.
+//
+/// Nominal ESP32 CSI frame rate; converts time windows to frame counts.
+const FALL_FPS: f64 = 15.0;
+/// Fast-EMA motion above which a frame counts as "active" (walking-class).
+/// Fix-A firmware scale: still ≈ 4, moving ≈ 9.
+const FALL_ACTIVITY_MBP: f64 = 7.0;
+/// Slow-EMA motion below which the subject counts as "still".
+const FALL_STILL_MBP: f64 = 6.0;
+/// Slow-EMA motion above which a downed subject is judged to have got up.
+const FALL_RECOVER_MBP: f64 = 9.0;
+/// Active frames required in the run-up so a fall only follows real activity.
+const FALL_ACTIVITY_FRAMES: u32 = 22; // ~1.5 s
+/// Seconds of sustained stillness required to confirm a fall.
+const FALL_CONFIRM_SECS: f64 = 2.0;
+
+/// Activity-then-stillness fall detector.  Runs per ESP32 CSI frame on the raw
+/// (pre-EMA) `motion_band_power`.  Returns `(detected, state, confidence,
+/// seconds_down)`.
+///
+/// A fall is detected as: the subject was actively moving, then motion drops
+/// to a sustained still level while they remain present in the zone.  This
+/// also fires if a person deliberately lies down and stays still — single-node
+/// WiFi cannot tell the two apart (no vertical/pose information) — which for a
+/// safety alarm is the safe direction to err.
+fn detect_fall(ns: &mut NodeState, raw_mbp: f64, present: bool) -> (bool, &'static str, f64, f64) {
+    // Two EMAs: a fast one for activity, a slow one (~1.3 s) that rides over
+    // the fidget spikes a downed-but-breathing subject produces.
+    ns.fall_motion_fast = 0.5 * raw_mbp + 0.5 * ns.fall_motion_fast;
+    ns.fall_motion_slow = 0.05 * raw_mbp + 0.95 * ns.fall_motion_slow;
+    let m_fast = ns.fall_motion_fast;
+    let m_slow = ns.fall_motion_slow;
+
+    // Run-length of recent activity: builds while moving, decays while still.
+    if m_fast > FALL_ACTIVITY_MBP {
+        ns.fall_active_run = (ns.fall_active_run + 1).min(150);
+    } else {
+        ns.fall_active_run = ns.fall_active_run.saturating_sub(1);
+    }
+
+    let confirm_frames = (FALL_CONFIRM_SECS * FALL_FPS) as u32;
+
+    match ns.fall_state {
+        // Normal — watch for "was active, now settled to still".
+        0 => {
+            if present
+                && m_slow < FALL_STILL_MBP
+                && ns.fall_active_run >= FALL_ACTIVITY_FRAMES
+            {
+                ns.fall_state = 1;
+                ns.fall_watch_frames = 0;
+                ns.fall_peak = ns.fall_active_run as f64;
+            }
+        }
+        // Watching — does the stillness persist (fall) or did motion resume
+        // (just a brief pause)?
+        1 => {
+            ns.fall_watch_frames += 1;
+            if !present {
+                ns.fall_state = 0; // left the zone → not a fall
+            } else if m_slow > FALL_STILL_MBP * 1.5 {
+                ns.fall_state = 0; // motion resumed → just a pause
+            } else if ns.fall_watch_frames >= confirm_frames {
+                ns.fall_state = 2; // confirmed: sustained stillness after activity
+                ns.fall_down_frames = 0;
+            }
+        }
+        // Fallen — stay until the subject gets up or leaves.
+        2 => {
+            ns.fall_down_frames += 1;
+            if !present || m_slow > FALL_RECOVER_MBP {
+                ns.fall_state = 0;
+            }
+        }
+        _ => ns.fall_state = 0,
+    }
+
+    // Returning to normal clears the per-event telemetry so the wire never
+    // reports a stale "6.7 s down / peak 128" after the subject recovered.
+    if ns.fall_state == 0 {
+        ns.fall_down_frames = 0;
+        ns.fall_peak = 0.0;
+        ns.fall_watch_frames = 0;
+    }
+
+    let detected = ns.fall_state == 2;
+    let state = match ns.fall_state {
+        1 => "watching",
+        2 => "fallen",
+        _ => "normal",
+    };
+    let confidence = if detected {
+        // A longer prior activity run makes a genuine fall more likely.
+        (0.55 + ns.fall_peak / 200.0).clamp(0.55, 0.95)
+    } else if ns.fall_state == 1 {
+        0.35
+    } else {
+        0.0
+    };
+    let seconds_down = ns.fall_down_frames as f64 / FALL_FPS;
+    (detected, state, confidence, seconds_down)
 }
 
 /// If an adaptive model is loaded, override the classification with the
@@ -1831,6 +2157,7 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
             persons: None,
             estimated_persons: if est_persons > 0 { Some(est_persons) } else { None },
             node_features: None,
+            fall: None,
         };
 
         // Populate persons from the sensing update (Kalman-smoothed via tracker).
@@ -1975,6 +2302,7 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
         persons: None,
         estimated_persons: if est_persons > 0 { Some(est_persons) } else { None },
         node_features: None,
+        fall: None,
     };
 
     let raw_persons = derive_pose_from_sensing(&update);
@@ -2078,7 +2406,13 @@ async fn handle_ws_client(mut socket: WebSocket, state: SharedState) {
                             break;
                         }
                     }
-                    Err(_) => break,
+                    // A slow client (e.g. a tablet over WiFi) cannot drain the
+                    // ~10 KB sensing_update at 10 Hz; TCP backpressure stalls
+                    // the send and the broadcast buffer overflows.  Skip the
+                    // dropped frames and keep the connection alive instead of
+                    // closing it — closing caused an endless reconnect loop.
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
             msg = socket.recv() => {
@@ -2233,6 +2567,102 @@ async fn health(State(state): State<SharedState>) -> Json<serde_json::Value> {
         "source": s.effective_source(),
         "tick": s.tick,
         "clients": s.tx.receiver_count(),
+    }))
+}
+
+/// Median of a slice (via a sorted copy).
+fn median_of(v: &[f64]) -> f64 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    let mut s: Vec<f64> = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    s[s.len() / 2]
+}
+
+/// POST /api/v1/calibration/collect — start a fixed sample window for one
+/// motion class.  Body: `{ "class": "...", "duration_s": 10 }`.
+async fn calibration_collect(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let class = body
+        .get("class")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let valid = ["absent", "present_still", "present_moving", "active"];
+    if !valid.contains(&class.as_str()) {
+        return Json(serde_json::json!({ "status": "error", "reason": "invalid class" }));
+    }
+    let dur = body
+        .get("duration_s")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(10.0)
+        .clamp(2.0, 30.0);
+    let mut s = state.write().await;
+    s.calib.samples.insert(class.clone(), Vec::new());
+    s.calib.active_class = Some(class.clone());
+    s.calib.collect_until = Some(std::time::Instant::now() + Duration::from_secs_f64(dur));
+    Json(serde_json::json!({ "status": "ok", "class": class, "duration_s": dur }))
+}
+
+/// GET /api/v1/calibration/state — collected samples + current calibration.
+async fn calibration_state(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let s = state.read().await;
+    let collecting = s
+        .calib
+        .collect_until
+        .map(|u| std::time::Instant::now() < u)
+        .unwrap_or(false);
+    let mut classes = serde_json::Map::new();
+    for cls in ["absent", "present_still", "present_moving", "active"] {
+        let (count, med) = match s.calib.samples.get(cls) {
+            Some(v) => (v.len(), median_of(v)),
+            None => (0, 0.0),
+        };
+        classes.insert(
+            cls.to_string(),
+            serde_json::json!({
+                "count": count,
+                "median_mbp": (med * 100.0).round() / 100.0,
+            }),
+        );
+    }
+    Json(serde_json::json!({
+        "collecting": collecting,
+        "active_class": s.calib.active_class,
+        "base": s.motion_cal_base,
+        "scale": s.motion_cal_scale,
+        "classes": classes,
+    }))
+}
+
+/// POST /api/v1/calibration/apply — derive base/scale from the collected
+/// samples, apply them live, and persist to `calibration.json`.
+async fn calibration_apply(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let mut s = state.write().await;
+    let still_n = s.calib.samples.get("present_still").map(|v| v.len()).unwrap_or(0);
+    let active_n = s.calib.samples.get("active").map(|v| v.len()).unwrap_or(0);
+    if still_n < 10 || active_n < 10 {
+        return Json(serde_json::json!({
+            "status": "error",
+            "reason": "collect present_still and active samples first",
+        }));
+    }
+    let still = median_of(s.calib.samples.get("present_still").unwrap());
+    let active = median_of(s.calib.samples.get("active").unwrap());
+    // base = still level → clean_motion ≈ 0 when still;
+    // scale = still→active span (floored so it can never divide by ~0).
+    let base = still;
+    let scale = (active - still).max(3.0);
+    s.motion_cal_base = base;
+    s.motion_cal_scale = scale;
+    save_calibration(base, scale);
+    Json(serde_json::json!({
+        "status": "ok",
+        "base": (base * 100.0).round() / 100.0,
+        "scale": (scale * 100.0).round() / 100.0,
     }))
 }
 
@@ -2525,8 +2955,12 @@ fn derive_single_person_pose(
 
     // ── Signal-derived scalars ────────────────────────────────────────────────
 
-    let motion_score = (feat.motion_band_power / 15.0).clamp(0.0, 1.0);
-    let is_walking = motion_score > 0.55;
+    // `feat.motion_band_power` is the EMA-smoothed metric.  Its still-subject
+    // noise floor sits around ~15, so we subtract a 15-unit baseline before
+    // scaling — only genuine, sustained motion above the floor drives the
+    // skeleton's stride/limb animation.
+    let motion_score = ((feat.motion_band_power - 15.0).max(0.0) / 25.0).clamp(0.0, 1.0);
+    let is_walking = motion_score > 0.45;
     let breath_amp = (feat.breathing_band_power * 4.0).clamp(0.0, 12.0);
 
     let breath_phase = if let Some(ref vs) = update.vital_signs {
@@ -2692,6 +3126,26 @@ fn derive_pose_from_sensing(update: &SensingUpdate) -> Vec<PersonDetection> {
 
     (0..person_count)
         .map(|idx| derive_single_person_pose(update, idx, person_count))
+        .collect()
+}
+
+/// Project a heuristic `PersonDetection` skeleton — laid out by
+/// `derive_single_person_pose` in a ~640×480 pixel canvas — into the
+/// `pose_keypoints` wire format: 17 × `[x, y, z, confidence]` with x,y
+/// normalised to [0,1].  This is what the Sensing-tab `PoseKeypointsView`
+/// canvas renders; the heuristic skeleton is motion-responsive whereas the
+/// cvitek model has too large a domain gap on this hardware.
+fn person_skeleton_to_keypoints(p: &PersonDetection) -> Vec<[f64; 4]> {
+    p.keypoints
+        .iter()
+        .map(|k| {
+            [
+                (k.x / 640.0).clamp(0.0, 1.0),
+                (k.y / 480.0).clamp(0.0, 1.0),
+                0.0,
+                k.confidence,
+            ]
+        })
         .collect()
 }
 
@@ -4148,7 +4602,8 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         signal_quality_score: None,
                         quality_verdict: None,
                         bssid_count: None,
-                        pose_keypoints: s.latest_keypoints.clone(),
+                        // Filled below from the heuristic skeleton (tracked).
+                        pose_keypoints: None,
                         model_status: None,
                         persons: None,
                         estimated_persons: if total_persons > 0 { Some(total_persons) } else { None },
@@ -4158,9 +4613,16 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         // can implement model-wake gating without round-
                         // tripping back to the server.
                         node_features: build_node_features(&s.node_states, now),
+                        fall: None,
                     };
 
                     let raw_persons = derive_pose_from_sensing(&update);
+                    // Heuristic skeleton → pose_keypoints: motion-responsive,
+                    // unlike the cvitek model whose domain gap is too large
+                    // on this hardware.  Taken before `raw_persons` moves
+                    // into the tracker below.
+                    update.pose_keypoints =
+                        raw_persons.first().map(|p| person_skeleton_to_keypoints(p));
                     let mut last_tracker_instant = s.last_tracker_instant.take();
                     let tracked = tracker_bridge::tracker_update(
                         &mut s.pose_tracker, &mut last_tracker_instant, raw_persons,
@@ -4170,9 +4632,13 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         update.persons = Some(tracked);
                     }
 
-                    if let Ok(json) = serde_json::to_string(&update) {
-                        let _ = s.tx.send(json);
-                    }
+                    // Do NOT broadcast per-frame here: with multiple ESP32
+                    // nodes the UDP frame rate (~30 Hz × N) drives the
+                    // ~22 KB sensing_update past what a WebSocket client
+                    // can drain (~1.3 MB/s at 2 nodes), so the connection
+                    // is dropped.  We only cache `latest_update`;
+                    // `broadcast_tick_task` re-broadcasts it at a fixed
+                    // 10 Hz, which is the single WS emission point.
                     s.latest_update = Some(update);
                     s.edge_vitals = Some(vitals);
                     continue;
@@ -4226,9 +4692,36 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     // Clone adaptive model before mutable borrow of node_states
                     // to avoid unsafe raw pointer (review finding #2).
                     let adaptive_model_clone = s.adaptive_model.clone();
+                    // Capture runtime calibration before borrowing node_states.
+                    let cal_base = s.motion_cal_base;
+                    let cal_scale = s.motion_cal_scale;
 
                     let ns = s.node_states.entry(node_id).or_insert_with(NodeState::new);
-                    ns.last_frame_time = Some(std::time::Instant::now());
+                    // Measure the real CSI frame rate (EMA) before overwriting
+                    // last_frame_time — the vital-sign FFT depends on it.
+                    let frame_now = std::time::Instant::now();
+                    if let Some(prev) = ns.last_frame_time {
+                        let dt = frame_now.duration_since(prev).as_secs_f64();
+                        if dt > 1e-3 {
+                            let inst_hz = (1.0 / dt).clamp(3.0, 40.0);
+                            ns.frame_rate_ema = 0.05 * inst_hz + 0.95 * ns.frame_rate_ema;
+                        }
+                        // A long gap means the node was offline (reboot, flash,
+                        // Wi-Fi drop).  The frames either side of the gap are a
+                        // discontinuity — reset the fall detector so the
+                        // transient cannot be mistaken for an activity→still
+                        // fall signature.
+                        if dt > 3.0 {
+                            ns.fall_state = 0;
+                            ns.fall_active_run = 0;
+                            ns.fall_down_frames = 0;
+                            ns.fall_watch_frames = 0;
+                            ns.fall_peak = 0.0;
+                            ns.fall_motion_fast = 0.0;
+                            ns.fall_motion_slow = 0.0;
+                        }
+                    }
+                    ns.last_frame_time = Some(frame_now);
 
                     // ADR-084 Pass 3: cluster-Pi novelty sensor.
                     // Score this frame's feature vector against the per-node
@@ -4248,9 +4741,47 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     }
 
                     let sample_rate_hz = 1000.0 / 500.0_f64;
-                    let (features, mut classification, breathing_rate_hz, sub_variances, raw_motion) =
+                    let (mut features, mut classification, breathing_rate_hz, sub_variances, _raw_motion) =
                         extract_features_from_frame(&frame, &ns.frame_history, sample_rate_hz);
-                    smooth_and_classify_node(ns, &mut classification, raw_motion);
+                    // Capture the raw (pre-EMA) per-window motion for fall
+                    // detection — the slow classifier EMA below would flatten
+                    // a brief fall impact away.
+                    let raw_mbp = features.motion_band_power;
+                    // EMA-smooth motion_band_power: the raw per-window metric
+                    // still has a noisy still-subject baseline (~15 with large
+                    // swings).  A slow EMA flattens it so the classifier's
+                    // baseline subtraction sees a stable noise floor.
+                    ns.motion_bp_ema = 0.1 * features.motion_band_power
+                                     + 0.9 * ns.motion_bp_ema;
+                    features.motion_band_power = ns.motion_bp_ema;
+                    // Drive classification from this single smoothed source
+                    // rather than extract_features' blend, whose variance and
+                    // change-point terms saturate and inject a constant bias.
+                    // The baseline/scale come from runtime calibration
+                    // (UI calibration page → calibration.json); defaults
+                    // match the Fix-A firmware (base 5, scale 7).
+                    let clean_motion =
+                        ((ns.motion_bp_ema - cal_base).max(0.0) / cal_scale)
+                            .clamp(0.0, 1.0);
+                    smooth_and_classify_node(ns, &mut classification, clean_motion);
+
+                    // Calibration sample collection: while the UI calibration
+                    // page is recording a class, log this node's smoothed
+                    // motion so `apply` can derive base/scale from real data.
+                    let cal_sample = ns.motion_bp_ema;
+
+                    // Fall detection — impact-then-stillness on raw motion.
+                    let (fall_detected, fall_state, fall_conf, fall_secs) =
+                        detect_fall(ns, raw_mbp, classification.presence);
+                    let fall_info = FallInfo {
+                        detected: fall_detected,
+                        state: fall_state.to_string(),
+                        confidence: fall_conf,
+                        seconds_down: fall_secs,
+                        motion_raw: raw_mbp,
+                        motion_fast: ns.fall_motion_fast,
+                        peak: ns.fall_peak,
+                    };
 
                     // Adaptive override using cloned model (safe, no raw pointers).
                     if let Some(ref model) = adaptive_model_clone {
@@ -4280,6 +4811,8 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         ns.rssi_history.pop_front();
                     }
 
+                    // Keep the vital-sign FFT locked to the real frame rate.
+                    ns.vital_detector.set_sample_rate(ns.frame_rate_ema);
                     let raw_vitals = ns.vital_detector.process_frame(
                         &frame.amplitudes,
                         &frame.phases,
@@ -4304,6 +4837,18 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     // Done with per-node mutable borrow; now read aggregated
                     // state from all nodes (the borrow of `ns` ends here).
                     // (We re-borrow node_states immutably via `s` below.)
+
+                    // Calibration sample collection (UI calibration page).
+                    if let Some(until) = s.calib.collect_until {
+                        if std::time::Instant::now() < until {
+                            if let Some(cls) = s.calib.active_class.clone() {
+                                s.calib.samples.entry(cls).or_default().push(cal_sample);
+                            }
+                        } else {
+                            s.calib.active_class = None;
+                            s.calib.collect_until = None;
+                        }
+                    }
 
                     s.rssi_history.push_back(features.mean_rssi);
                     if s.rssi_history.len() > 60 {
@@ -4357,7 +4902,9 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                             rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
                             position: [2.0, 0.0, 1.5],
                             amplitude: n.frame_history.back()
-                                .map(|a| a.iter().take(56).cloned().collect())
+                                .map(|a| a.iter().take(56)
+                                    .map(|v| (v * 100.0).round() / 100.0)
+                                    .collect())
                                 .unwrap_or_default(),
                             subcarrier_count: n.frame_history.back().map_or(0, |a| a.len()),
                         })
@@ -4382,7 +4929,8 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         signal_quality_score: None,
                         quality_verdict: None,
                         bssid_count: None,
-                        pose_keypoints: s.latest_keypoints.clone(),
+                        // Filled below from the heuristic skeleton (tracked).
+                        pose_keypoints: None,
                         model_status: None,
                         persons: None,
                         estimated_persons: if total_persons > 0 { Some(total_persons) } else { None },
@@ -4392,21 +4940,42 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         // can implement model-wake gating without round-
                         // tripping back to the server.
                         node_features: build_node_features(&s.node_states, now),
+                        fall: Some(fall_info),
                     };
 
                     let raw_persons = derive_pose_from_sensing(&update);
+                    // Heuristic skeleton → pose_keypoints: motion-responsive,
+                    // unlike the cvitek model whose domain gap is too large
+                    // on this hardware.  Taken before `raw_persons` moves
+                    // into the tracker below.
+                    update.pose_keypoints =
+                        raw_persons.first().map(|p| person_skeleton_to_keypoints(p));
                     let mut last_tracker_instant = s.last_tracker_instant.take();
-                    let tracked = tracker_bridge::tracker_update(
+                    let mut tracked = tracker_bridge::tracker_update(
                         &mut s.pose_tracker, &mut last_tracker_instant, raw_persons,
                     );
                     s.last_tracker_instant = last_tracker_instant;
+                    // The tracker can spawn ghost tracks when a single
+                    // person's heuristic keypoints jump between frames during
+                    // vigorous movement.  `estimated_persons` is the reliable
+                    // count — never surface more persons than that; keep the
+                    // highest-confidence tracks.
+                    let person_cap = update.estimated_persons.unwrap_or(1).max(1);
+                    if tracked.len() > person_cap {
+                        tracked.sort_by(|a, b| {
+                            b.confidence
+                                .partial_cmp(&a.confidence)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        tracked.truncate(person_cap);
+                    }
                     if !tracked.is_empty() {
                         update.persons = Some(tracked);
                     }
 
-                    if let Ok(json) = serde_json::to_string(&update) {
-                        let _ = s.tx.send(json);
-                    }
+                    // Per-frame WS broadcast removed — see the vitals path
+                    // above.  `broadcast_tick_task` is the single 10 Hz WS
+                    // emission point; here we only refresh the cache.
                     s.latest_update = Some(update);
 
                     // Evict stale nodes every 100 ticks to prevent memory leak.
@@ -4545,6 +5114,7 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
             persons: None,
             estimated_persons: if est_persons > 0 { Some(est_persons) } else { None },
             node_features: None,
+            fall: None,
         };
 
         // Populate persons from the sensing update (Kalman-smoothed via tracker).
@@ -5402,6 +5972,8 @@ async fn main() {
     let inference_backend_handle = backend_init.handle;
 
     let (tx, _) = broadcast::channel::<String>(256);
+    let (calib_base, calib_scale) = load_calibration();
+    info!("Motion calibration: base={calib_base:.2} scale={calib_scale:.2}");
     let state: SharedState = Arc::new(RwLock::new(AppStateInner {
         latest_update: None,
         rssi_history: VecDeque::new(),
@@ -5483,6 +6055,9 @@ async fn main() {
         // by the cvitek tick-task inference dispatch.
         phase_history: VecDeque::new(),
         latest_keypoints: None,
+        motion_cal_base: calib_base,
+        motion_cal_scale: calib_scale,
+        calib: CalibrationState::default(),
     }));
 
     // Start background tasks based on source
@@ -5536,6 +6111,10 @@ async fn main() {
         .route("/api/v1/metrics", get(health_metrics))
         // Sensing endpoints
         .route("/api/v1/sensing/latest", get(latest))
+        // Interactive motion calibration (UI calibration page)
+        .route("/api/v1/calibration/collect", post(calibration_collect))
+        .route("/api/v1/calibration/state", get(calibration_state))
+        .route("/api/v1/calibration/apply", post(calibration_apply))
         // Per-node health endpoint
         .route("/api/v1/nodes", get(nodes_endpoint))
         // Vital sign endpoints

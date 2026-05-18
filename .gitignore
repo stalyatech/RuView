@@ -3,6 +3,7 @@ CLAUDE.local.md
 
 # ESP32 firmware build artifacts and local config (contains WiFi credentials)
 firmware/esp32-csi-node/build/
+firmware/esp32-csi-node/build_supermini/
 firmware/esp32-csi-node/sdkconfig
 firmware/esp32-csi-node/sdkconfig.defaults
 firmware/esp32-csi-node/sdkconfig.old

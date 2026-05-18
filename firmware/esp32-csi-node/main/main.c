@@ -32,6 +32,7 @@
 #include "swarm_bridge.h"
 #include "rv_radio_ops.h"          /* ADR-081 Layer 1 — Radio Abstraction Layer. */
 #include "adaptive_controller.h"   /* ADR-081 Layer 2 — Adaptive controller. */
+#include "led_status.h"
 #ifdef CONFIG_CSI_MOCK_ENABLED
 #include "mock_csi.h"
 #endif
@@ -61,17 +62,24 @@ static void event_handler(void *arg, esp_event_base_t event_base,
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        // Log the reason code so beacon-timeout (200) is distinguishable
+        // from auth / assoc failures (2, 4, 15) in the field.
+        wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)event_data;
+        ESP_LOGW(TAG, "STA disconnected reason=%u rssi=%d",
+                 (unsigned)d->reason, (int)d->rssi);
         if (s_retry_num < MAX_RETRY) {
             esp_wifi_connect();
             s_retry_num++;
             ESP_LOGI(TAG, "Retrying WiFi connection (%d/%d)", s_retry_num, MAX_RETRY);
         } else {
+            led_status_set(LED_STATE_WIFI_FAIL);
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
+        led_status_set(LED_STATE_CONNECTED);
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
@@ -113,7 +121,14 @@ static void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "WiFi STA initialized, connecting to SSID: %s", g_nvs_config.wifi_ssid);
+    // CSI streamer runs hot (~100 Hz UDP).  Default WIFI_PS_MIN_MODEM lets
+    // the modem nap between DTIM beacons, which makes the AP think we left
+    // and drop the association after ~30–90 s.  Pin to NONE so the radio
+    // stays fully awake — matches the long-running CSI capture profile.
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+
+    ESP_LOGI(TAG, "WiFi STA initialized (PS=NONE), connecting to SSID: %s",
+             g_nvs_config.wifi_ssid);
 
     /* Wait for connection */
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
@@ -136,6 +151,9 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    /* Status LED — slow blink until WiFi connects. */
+    led_status_init();
 
     /* Load runtime config (NVS overrides Kconfig defaults) */
     nvs_config_load(&g_nvs_config);

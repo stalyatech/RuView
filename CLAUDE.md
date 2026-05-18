@@ -77,10 +77,21 @@ All 5 ruvector crates integrated in workspace:
 |--------|------|------|------|------|
 | ESP32-S3 (8MB flash) | COM7 | Xtensa dual-core | WiFi CSI sensing node | ~$9 |
 | ESP32-S3 SuperMini (4MB) | — | Xtensa dual-core | WiFi CSI (compact) | ~$6 |
-| ESP32-C6 + Seeed MR60BHA2 | COM4 | RISC-V + 60 GHz FMCW | mmWave HR/BR/presence | ~$15 |
+| ESP32-S3-MINI-1 N4R2 (4MB + 2MB Quad PSRAM) | — | Xtensa dual-core | WiFi CSI sensing node | ~$6 |
+| ESP32-C6 + Seeed MR60BHA2 | COM4 | RISC-V + 60 GHz FMCW | mmWave HR/BR/presence (C6 is UART bridge only — see below) | ~$15 |
 | HLK-LD2410 | — | 24 GHz FMCW | Presence + distance | ~$3 |
 
-**Not supported:** ESP32 (original), ESP32-C3 — single-core, can't run CSI DSP pipeline.
+**Not supported for on-device CSI DSP:**
+- **ESP32 (original, LX6 dual-core):** PSRAM locked to 40 MHz by silicon bug
+  (Espressif errata 3.16), CSI phase noise ~3× worse than S3, no USB Serial-JTAG,
+  WiFi + Classic-BT coexistence corrupts CSI frames, channel-hop glitch ~50-100 ms
+  (S3: ~10 ms). WROOM-32 has no PSRAM at all so WASM init fails; WROVER builds
+  but cannot meet the 20 Hz pipeline deadline.
+- **ESP32-C3:** single-core RISC-V, **no hardware FPU** — soft-FP makes CSI DSP
+  (atan2f/sqrtf per subcarrier, Kalman, FFT) ~10-30× slower per op.
+- **ESP32-C6:** single HP RISC-V core + 1 LP core, **no hardware FPU**, no
+  SIMD/DSP intrinsics, most modules ship without PSRAM. Suitable as a UART
+  bridge to MR60BHA2 (60 GHz module does its own DSP), not for on-device CSI DSP.
 
 ### Build & Test Commands (this repo)
 ```bash

@@ -247,17 +247,6 @@ static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
     }
 }
 
-/**
- * Promiscuous mode callback — required for CSI to fire on all received frames.
- * We don't need the packet content, just the CSI triggered by reception.
- */
-static void wifi_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type)
-{
-    /* No-op: CSI callback is registered separately and fires in parallel. */
-    (void)buf;
-    (void)type;
-}
-
 void csi_collector_set_node_id(uint8_t node_id)
 {
     s_node_id = node_id;
@@ -336,34 +325,35 @@ void csi_collector_init(void)
     /* Update the hop table's first channel to match. */
     s_hop_channels[0] = csi_channel;
 
-    /* Enable promiscuous mode — required for reliable CSI callbacks.
-     * Without this, CSI only fires on frames destined to this station,
-     * which may be very infrequent on a quiet network. */
-    ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
-    ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(wifi_promiscuous_cb));
-
-    /* MGMT-only promiscuous filter + active probe injection (RuView#396).
+    /* CSI capture runs in plain STA mode — no promiscuous.
      *
-     * DATA frames cause 100-500+ WiFi HW interrupts/sec which crashes Core 0
-     * in wDev_ProcessFiq (SPI flash cache race in ESP-IDF WiFi blob).
-     * MGMT-only gives ~10 Hz (beacons). Probe request injection at 10 Hz
-     * adds ~10 Hz probe responses from APs → ~20 Hz total, matching the
-     * edge processing designed sample rate of 20 Hz. */
-    wifi_promiscuous_filter_t filt = {
-        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT,
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_promiscuous_filter(&filt));
-
-    ESP_LOGI(TAG, "Promiscuous mode enabled (MGMT-only, RuView#396)");
-
+     * The earlier MGMT-only promiscuous setup never produced a single CSI
+     * callback on ESP32-S3 / ESP-IDF v5.2 (s_cb_invoke stayed 0): the WiFi
+     * blob does not raise the CSI callback for promiscuous-filtered beacon
+     * frames.  In plain STA mode `esp_wifi_set_csi(true)` raises the CSI
+     * callback for every frame the station receives — its own AP's
+     * beacons (~10 Hz) plus any unicast traffic (ARP, ping replies).  An
+     * AP-side keepalive ping then lifts the rate to whatever cadence we
+     * need.  This is the approach ESP-IDF's own `wifi_csi` example uses.
+     *
+     * RuView#396 (DATA-frame interrupt storm crashing Core 0) does not
+     * apply here: STA mode only delivers frames addressed to this node,
+     * not every DATA frame on the channel. */
+    // L-LTF only.  With both lltf_en and htltf_en the radio emits a mix of
+    // legacy (L-LTF) and HT (HT-LTF) CSI — different lengths and scales —
+    // so consecutive frames are not comparable and the temporal diff is
+    // dominated by CSI-type switching, not body motion (observed: frame
+    // mean amplitude bimodal at ~16 vs ~27).  L-LTF is present in *every*
+    // received frame, giving one consistent CSI type for a stable temporal
+    // signal.  manu_scale fixes the gain so AGC does not rescale frames.
     wifi_csi_config_t csi_config = {
         .lltf_en = true,
-        .htltf_en = true,
-        .stbc_htltf2_en = true,
-        .ltf_merge_en = true,
-        .channel_filter_en = false,
-        .manu_scale = false,
-        .shift = false,
+        .htltf_en = false,
+        .stbc_htltf2_en = false,
+        .ltf_merge_en = false,
+        .channel_filter_en = true,
+        .manu_scale = true,
+        .shift = true,
     };
 
     ESP_ERROR_CHECK(esp_wifi_set_csi_config(&csi_config));

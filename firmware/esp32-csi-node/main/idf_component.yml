@@ -8,3 +8,6 @@ dependencies:
 
   ## LCD touch abstraction
   espressif/esp_lcd_touch: "^1.0"
+
+  ## WS2812 RGB LED driver (ESP32-S3 Zero onboard RGB on GPIO21)
+  espressif/led_strip: "^2.4"

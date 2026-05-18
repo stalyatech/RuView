@@ -1,0 +1,56 @@
+# ESP32-S3 CSI Node — 4 MB flash, NO PSRAM SDK Configuration
+# Target board: ESP32-S3 SuperMini Development Board (Aliexpress generic),
+#               ESP32-S3-FN4 / similar 4MB-flash, no-PSRAM modules.
+#
+# NOTE: Do NOT enable CONFIG_SPIRAM here. SuperMini modules do not carry a
+# PSRAM die; enabling SPIRAM_BOOT_INIT on them drives the (non-existent)
+# external SPI bus continuously, which clashes with flash SPI on shared
+# pins and causes the SoC to overheat in a boot/recover loop.
+
+CONFIG_IDF_TARGET="esp32s3"
+
+# 4 MB flash partition table
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_4mb.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# Flash interface — QIO is fine here (no PSRAM contention).
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# Compiler: optimize for size (critical for 4 MB flash)
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
+# CSI support
+CONFIG_ESP_WIFI_CSI_ENABLED=y
+
+# Disable AMOLED display (ADR-045 requires 8 MB flash + PSRAM framebuffer)
+# CONFIG_DISPLAY_ENABLE is not set
+
+# Reduce logging footprint
+CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+CONFIG_LWIP_SO_RCVBUF=y
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# ADR-081: adaptive_controller runs emit_feature_state + stream_sender
+# network I/O inside Timer Svc callbacks, exceeding the 2 KiB default.
+CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=8192
+
+# Extra WiFi IRAM placement (RuView#396 SPI cache race mitigation)
+CONFIG_ESP_WIFI_EXTRA_IRAM_OPT=y
+
+# CSI streamer should not let the modem sleep while waiting to re-associate
+# — keeps reconnect fast and reduces beacon-loss → AP-drop cycles seen in
+# the field (dmesg "Del sta" every 30-90 s on the SG2000 AP).
+CONFIG_ESP_WIFI_STA_DISCONNECTED_PM_ENABLE=n
+
+# RuView sensing-server consumes raw ADR-018 CSI frames (magic 0xC5110001).
+# adaptive_controller (ADR-081) at tier 2 replaces raw CSI with compact
+# feature-state packets (magic 0xC5110006) which the server can't parse,
+# leaving the pipeline starved.  Force tier 0 so the radio keeps emitting
+# raw CSI; edge DSP and feature-state are still available in the firmware
+# for a future server-side upgrade.
+CONFIG_EDGE_TIER=0
